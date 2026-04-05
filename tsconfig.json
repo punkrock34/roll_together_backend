@@ -1,12 +1,15 @@
 {
-    "compilerOptions": {
-        "target": "ES6",
-        "module": "commonjs",
-        "esModuleInterop": true,
-        "outDir": "./build",
-        "alwaysStrict": true,
-        "strict": true
-    },
-    "include": ["./src/*"],
-    "exclude": ["./node_modules/**"]
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "CommonJS",
+    "moduleResolution": "Node",
+    "strict": true,
+    "outDir": "dist",
+    "rootDir": "src",
+    "esModuleInterop": true,
+    "resolveJsonModule": true,
+    "skipLibCheck": true,
+    "types": ["node", "vitest/globals"]
+  },
+  "include": ["src/**/*.ts"]
 }

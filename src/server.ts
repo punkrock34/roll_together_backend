@@ -1,164 +1,268 @@
-import { Server as SocketServer, Socket } from "socket.io";
+import { createServer as createHttpServer } from "node:http";
+
+import cors from "cors";
 import express from "express";
-import { createServer } from "http";
+import { WebSocketServer, WebSocket } from "ws";
 
-enum VideoState {
-  PLAYING = "playing",
-  PAUSED = "paused",
+import { getConfig, type AppConfig } from "./config";
+import {
+  PROTOCOL_VERSION,
+  parseClientMessage,
+  type ErrorMessage,
+  type JoinedMessage,
+  type PingMessage,
+  type PongMessage,
+  type PresenceMessage,
+  type ServerMessage,
+  type SyncBroadcastMessage,
+} from "./protocol";
+import { RoomStore } from "./room-store";
+
+interface SocketContext {
+  roomId?: string;
+  sessionId?: string;
 }
 
-interface Room {
-  state: VideoState;
-  progress: {
-    value: number;
-    lastUpdate: Date;
+export function buildHealthPayload(store: RoomStore, startedAt: number) {
+  return {
+    status: "ok",
+    uptimeSeconds: Math.floor((Date.now() - startedAt) / 1000),
+    roomCount: store.getRoomCount(),
+    connectedParticipants: store.getConnectedParticipantCount(),
+    protocolVersion: PROTOCOL_VERSION,
   };
-  users: Set<string>;
 }
 
-interface ServerToClientEvents {
-  update: (
-    senderId: string,
-    state: VideoState,
-    progress: number,
-    userCount: number
-  ) => void;
-  join: (
-    roomId: string,
-    state: VideoState,
-    progress: number,
-    userCount: number
-  ) => void;
+export function buildVersionPayload() {
+  return {
+    name: "roll-together-backend",
+    version: process.env.npm_package_version ?? "1.0.0",
+    protocolVersion: PROTOCOL_VERSION,
+  };
 }
 
-interface ClientToServerEvents {
-  update: (state: VideoState, progress: number) => void;
-}
+export function createRollTogetherServer(config: AppConfig = getConfig()) {
+  const store = new RoomStore({
+    roomTtlMs: config.roomTtlMs,
+    reconnectGraceMs: config.reconnectGraceMs,
+  });
 
-const PORT: number = parseInt(process.env.PORT || "3000");
-const rooms: { [key: string]: Room } = {};
-
-const joinRoom = (roomId: string, socket: Socket, initialProgress: number) => {
-  if (rooms[roomId] === undefined) {
-    rooms[roomId] = {
-      state: VideoState.PAUSED,
-      progress: { value: initialProgress, lastUpdate: new Date() },
-      users: new Set(),
-    };
-  }
-  socket.join(roomId);
-  rooms[roomId].state = VideoState.PAUSED;
-  rooms[roomId].users.add(socket.id);
-};
-
-const leaveRoom = (roomId: string, socket: Socket) => {
-  // It will automatically leave the room for socketIO
-  rooms[roomId].users.delete(socket.id);
-  if (rooms[roomId].users.size === 0) {
-    delete rooms[roomId];
-  }
-};
-
-const getUserCount = (roomId: string) => {
-  return rooms[roomId].users.size;
-};
-
-const updateVideoState = (roomId: string, state: VideoState) => {
-  rooms[roomId].state = state;
-};
-
-const getVideoState = (roomId: string) => {
-  return rooms[roomId].state;
-};
-
-const updateRoomProgress = (roomId: string, progress: number) => {
-  rooms[roomId].progress.lastUpdate = new Date();
-  rooms[roomId].progress.value = progress;
-};
-
-const getVideoProgress = (roomId: string) => {
-  const additionalProgress =
-    rooms[roomId].state === VideoState.PLAYING
-      ? (new Date().getTime() - rooms[roomId].progress.lastUpdate.getTime()) /
-        1000
-      : 0;
-
-  return rooms[roomId].progress.value + additionalProgress;
-};
-
-const app = express();
-const httpServer = createServer(app);
-const io = new SocketServer<ClientToServerEvents, ServerToClientEvents>(
-  httpServer,
-  {
-    cors: {
-      origin: true,
-      credentials: true,
-    },
-  }
-);
-
-io.on("connection", (socket) => {
-  const roomId = first(socket.handshake.query["room"]) || genId();
-  const initialProgress = parseInt(
-    first(socket.handshake.query["videoProgress"]) || "0"
+  const startedAt = Date.now();
+  const app = express();
+  app.use(
+    cors({ origin: config.corsOrigin === "*" ? true : config.corsOrigin }),
   );
 
-  console.log("Received connection try", { roomId, initialProgress });
-
-  socket.on("disconnect", () => {
-    console.log(
-      `Client from room ${roomId} disconnected. Current room state: `,
-      rooms[roomId]
-    );
-    leaveRoom(roomId, socket);
+  app.get("/health", (_request, response) => {
+    response.json(buildHealthPayload(store, startedAt));
   });
 
-  socket.on("update", (videoState, videoProgress) => {
-    console.log(`Received Update from ${socket.id} to ${roomId}`, {
-      videoState,
-      videoProgress,
+  app.get("/version", (_request, response) => {
+    response.json(buildVersionPayload());
+  });
+
+  const httpServer = createHttpServer(app);
+  const wsServer = new WebSocketServer({ server: httpServer, path: "/ws" });
+  const socketContexts = new WeakMap<WebSocket, SocketContext>();
+
+  const send = (socket: WebSocket, message: ServerMessage) => {
+    if (socket.readyState === WebSocket.OPEN) {
+      socket.send(JSON.stringify(message));
+    }
+  };
+
+  const sendError = (socket: WebSocket, code: string, message: string) => {
+    const payload: ErrorMessage = {
+      type: "error",
+      version: PROTOCOL_VERSION,
+      code,
+      message,
+    };
+    send(socket, payload);
+  };
+
+  const broadcastPresence = (roomId: string) => {
+    const snapshot = store.getSnapshot(roomId);
+    if (!snapshot) {
+      return;
+    }
+
+    const payload: PresenceMessage = {
+      type: "presence",
+      version: PROTOCOL_VERSION,
+      roomId,
+      participantCount: snapshot.participantCount,
+      participants: snapshot.participants,
+    };
+
+    for (const client of wsServer.clients) {
+      const context = socketContexts.get(client);
+      if (context?.roomId === roomId) {
+        send(client, payload);
+      }
+    }
+  };
+
+  wsServer.on("connection", (socket) => {
+    socketContexts.set(socket, {});
+
+    socket.on("message", (raw) => {
+      const message = parseClientMessage(raw.toString());
+      if (!message) {
+        sendError(
+          socket,
+          "invalid_message",
+          "The backend could not parse that message.",
+        );
+        return;
+      }
+
+      const context = socketContexts.get(socket) ?? {};
+
+      switch (message.type) {
+        case "join": {
+          const joined = store.join({
+            roomId: message.roomId,
+            sessionId: message.sessionId,
+            playback: message.playback,
+          });
+
+          socketContexts.set(socket, {
+            roomId: joined.roomId,
+            sessionId: joined.sessionId,
+          });
+
+          const payload: JoinedMessage = {
+            type: "joined",
+            version: PROTOCOL_VERSION,
+            roomId: joined.roomId,
+            sessionId: joined.sessionId,
+            participantCount: joined.participantCount,
+            participants: joined.participants,
+            playback: joined.playback,
+          };
+
+          send(socket, payload);
+          broadcastPresence(joined.roomId);
+          break;
+        }
+        case "sync": {
+          if (!context.roomId || !context.sessionId) {
+            sendError(
+              socket,
+              "not_joined",
+              "Join a room before sending sync events.",
+            );
+            return;
+          }
+
+          const snapshot = store.sync(
+            context.roomId,
+            context.sessionId,
+            message.playback,
+          );
+          if (!snapshot) {
+            sendError(socket, "unknown_room", "The room no longer exists.");
+            return;
+          }
+
+          const payload: SyncBroadcastMessage = {
+            type: "sync",
+            version: PROTOCOL_VERSION,
+            roomId: context.roomId,
+            participantId: context.sessionId,
+            participantCount: snapshot.participantCount,
+            playback: snapshot.playback,
+          };
+
+          for (const client of wsServer.clients) {
+            const clientContext = socketContexts.get(client);
+            if (
+              clientContext?.roomId === context.roomId &&
+              clientContext.sessionId !== context.sessionId
+            ) {
+              send(client, payload);
+            }
+          }
+          break;
+        }
+        case "leave": {
+          if (context.roomId && context.sessionId) {
+            store.leave(context.roomId, context.sessionId);
+            broadcastPresence(context.roomId);
+          }
+          socketContexts.set(socket, {});
+          socket.close();
+          break;
+        }
+        case "ping": {
+          const payload: PongMessage = {
+            type: "pong",
+            version: PROTOCOL_VERSION,
+            sentAt: (message as PingMessage).sentAt,
+            receivedAt: Date.now(),
+          };
+          send(socket, payload);
+          break;
+        }
+      }
     });
-    updateVideoState(roomId, videoState);
-    updateRoomProgress(roomId, videoProgress);
 
-    socket
-      .to(roomId)
-      .emit(
-        "update",
-        socket.id,
-        getVideoState(roomId),
-        getVideoProgress(roomId),
-        getUserCount(roomId)
-      );
+    socket.on("close", () => {
+      const context = socketContexts.get(socket);
+      if (context?.roomId && context.sessionId) {
+        store.markDisconnected(context.roomId, context.sessionId);
+        broadcastPresence(context.roomId);
+      }
+    });
   });
 
-  joinRoom(roomId, socket, initialProgress);
+  const pruneInterval = setInterval(() => {
+    store.prune();
+  }, 30_000);
 
-  const userCount = getUserCount(roomId);
-  const progress = getVideoProgress(roomId);
-  const videoState = getVideoState(roomId);
+  return {
+    app,
+    store,
+    httpServer,
+    wsServer,
+    async start() {
+      await new Promise<void>((resolve) => {
+        httpServer.listen(config.port, config.host, () => resolve());
+      });
+    },
+    async stop() {
+      clearInterval(pruneInterval);
 
-  socket.emit("join", roomId, videoState, progress, userCount);
-  socket.to(roomId).emit("update", socket.id, videoState, progress, userCount);
-});
+      for (const client of wsServer.clients) {
+        client.close();
+      }
 
-function first<T>(value: T | T[]) {
-  if (Array.isArray(value)) {
-    return value.length > 0 ? value[0] : null;
-  }
-  return value;
+      await new Promise<void>((resolve, reject) => {
+        httpServer.close((error) => {
+          if (error) {
+            reject(error);
+            return;
+          }
+          resolve();
+        });
+      });
+    },
+  };
 }
 
-function genId() {
-  const length = 20;
-  const characters =
-    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
-
-  const id = Array.from(Array(length))
-    .map((_) => characters[Math.floor(Math.random() * characters.length)])
-    .join("");
-  return id;
+if (require.main === module) {
+  const server = createRollTogetherServer();
+  server
+    .start()
+    .then(() => {
+      const config = getConfig();
+      console.log(
+        `Roll Together backend listening on http://${config.host}:${config.port}`,
+      );
+    })
+    .catch((error) => {
+      console.error("Failed to start Roll Together backend", error);
+      process.exitCode = 1;
+    });
 }
-
-httpServer.listen(PORT);
