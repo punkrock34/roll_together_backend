@@ -65,10 +65,31 @@ Health endpoint:
 curl http://localhost:3000/health
 ```
 
+If port `3000` is already in use on your host, keep the app listening on
+container port `3000` and change only the published host port in `.env`:
+
+```env
+HOST_PORT=3001
+PORT=3000
+```
+
+Then start the stack again:
+
+```bash
+docker compose up -d --build
+```
+
+Your health check would then be:
+
+```bash
+curl http://localhost:3001/health
+```
+
 ## Configuration
 
 See `.env.example` for the supported settings:
 
+- `HOST_PORT`
 - `PORT`
 - `HOST`
 - `ROOM_TTL_MS`
