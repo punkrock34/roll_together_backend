@@ -103,6 +103,32 @@ describe("RoomStore", () => {
     ).toContain("example-2");
   });
 
+  it("stores participant display names in presence snapshots", () => {
+    const store = new RoomStore({
+      roomTtlMs: 60_000,
+      reconnectGraceMs: 30_000,
+    });
+
+    store.join({
+      roomId: "room-1",
+      playback,
+      sessionId: "host-1",
+      displayName: "PunkRock",
+      now: 100,
+    });
+    const joined = store.join({
+      roomId: "room-1",
+      playback: { ...playback, currentTime: 14, updatedAt: 120 },
+      sessionId: "viewer-1",
+      displayName: "Friend",
+      now: 120,
+    });
+
+    expect(
+      joined.participants.map((participant) => participant.displayName),
+    ).toEqual(["PunkRock", "Friend"]);
+  });
+
   it("removes an empty room immediately after the last participant leaves", () => {
     const store = new RoomStore({ roomTtlMs: 50, reconnectGraceMs: 10 });
     store.join({ roomId: "room-2", playback, sessionId: "session-2", now: 0 });

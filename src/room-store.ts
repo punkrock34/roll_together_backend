@@ -8,6 +8,7 @@ import type {
 
 interface ParticipantRecord {
   sessionId: string;
+  displayName: string;
   joinedAt: number;
   lastSeenAt: number;
   connected: boolean;
@@ -55,6 +56,7 @@ interface RoomStoreOptions {
 interface JoinInput {
   roomId?: string;
   sessionId?: string;
+  displayName?: string;
   playback: PlaybackSnapshot;
   now?: number;
 }
@@ -80,9 +82,15 @@ export class RoomStore {
     const sessionId =
       participant?.sessionId ?? input.sessionId ?? this.createId(12);
     const joinedAt = participant?.joinedAt ?? now;
+    const displayName = resolveParticipantDisplayName(
+      input.displayName,
+      participant?.displayName,
+      sessionId,
+    );
 
     room.participants.set(sessionId, {
       sessionId,
+      displayName,
       joinedAt,
       lastSeenAt: now,
       connected: true,
@@ -272,6 +280,7 @@ export class RoomStore {
       .filter((participant) => participant.connected)
       .map<ParticipantPresence>((participant) => ({
         sessionId: participant.sessionId,
+        displayName: participant.displayName,
         isHost: participant.sessionId === room.hostSessionId,
         joinedAt: participant.joinedAt,
         lastSeenAt: participant.lastSeenAt,
@@ -339,4 +348,21 @@ function shouldAcceptPlaybackUpdate(
     currentPlayback.duration !== nextPlayback.duration ||
     currentPlayback.updatedAt < nextPlayback.updatedAt
   );
+}
+
+function resolveParticipantDisplayName(
+  nextDisplayName: string | undefined,
+  existingDisplayName: string | undefined,
+  sessionId: string,
+) {
+  const trimmed = nextDisplayName?.trim();
+  if (trimmed) {
+    return trimmed.slice(0, 40);
+  }
+
+  if (existingDisplayName) {
+    return existingDisplayName;
+  }
+
+  return `Guest ${sessionId.slice(0, 4)}`;
 }

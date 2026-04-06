@@ -181,6 +181,7 @@ export function createRollTogetherServer(config: AppConfig = getConfig()) {
           const joined = store.join({
             roomId: message.roomId,
             sessionId: message.sessionId,
+            displayName: message.displayName,
             playback: message.playback,
           });
 
