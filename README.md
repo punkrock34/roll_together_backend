@@ -59,6 +59,7 @@ npm run dev
 ## Docs
 
 - [API and protocol notes](docs/api.md)
+- [Self-hosting guide](docs/self-hosting.md)
 - [Deployment and configuration](docs/deployment.md)
 - Reverse proxy example: [docs/nginx.conf](docs/nginx.conf)
 - Apache reverse proxy example: [docs/apache.conf](docs/apache.conf)
