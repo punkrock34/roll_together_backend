@@ -1,7 +1,8 @@
-export const PROTOCOL_VERSION = 1;
+export const PROTOCOL_VERSION = 2;
 
 export type ProviderName = "crunchyroll";
 export type PlaybackState = "playing" | "paused";
+export type RoomMutationErrorCode = "unknown_room" | "not_joined" | "not_host";
 
 export interface EpisodeInfo {
   provider: ProviderName;
@@ -39,6 +40,12 @@ export interface SyncMessage {
   playback: PlaybackSnapshot;
 }
 
+export interface NavigateMessage {
+  type: "navigate";
+  version: number;
+  playback: PlaybackSnapshot;
+}
+
 export interface LeaveMessage {
   type: "leave";
   version: number;
@@ -53,26 +60,35 @@ export interface PingMessage {
 export type ClientMessage =
   | JoinMessage
   | SyncMessage
+  | NavigateMessage
   | LeaveMessage
   | PingMessage;
 
-export interface JoinedMessage {
-  type: "joined";
-  version: number;
+interface RoomSnapshotMessageBase {
   roomId: string;
-  sessionId: string;
   participantCount: number;
   participants: ParticipantPresence[];
+  hostSessionId: string;
   playback: PlaybackSnapshot;
 }
 
-export interface SyncBroadcastMessage {
-  type: "sync";
+export interface JoinedMessage extends RoomSnapshotMessageBase {
+  type: "joined";
   version: number;
-  roomId: string;
+  sessionId: string;
+}
+
+interface RoomBroadcastMessageBase extends RoomSnapshotMessageBase {
+  version: number;
   participantId: string;
-  participantCount: number;
-  playback: PlaybackSnapshot;
+}
+
+export interface SyncBroadcastMessage extends RoomBroadcastMessageBase {
+  type: "sync";
+}
+
+export interface NavigateBroadcastMessage extends RoomBroadcastMessageBase {
+  type: "navigate";
 }
 
 export interface PresenceMessage {
@@ -81,6 +97,7 @@ export interface PresenceMessage {
   roomId: string;
   participantCount: number;
   participants: ParticipantPresence[];
+  hostSessionId: string;
 }
 
 export interface PongMessage {
@@ -93,13 +110,14 @@ export interface PongMessage {
 export interface ErrorMessage {
   type: "error";
   version: number;
-  code: string;
+  code: RoomMutationErrorCode | "invalid_message";
   message: string;
 }
 
 export type ServerMessage =
   | JoinedMessage
   | SyncBroadcastMessage
+  | NavigateBroadcastMessage
   | PresenceMessage
   | PongMessage
   | ErrorMessage;
@@ -143,6 +161,10 @@ export function parseClientMessage(raw: string): ClientMessage | null {
     case "sync":
       return isPlaybackSnapshot(parsed.playback)
         ? (parsed as unknown as SyncMessage)
+        : null;
+    case "navigate":
+      return isPlaybackSnapshot(parsed.playback)
+        ? (parsed as unknown as NavigateMessage)
         : null;
     case "leave":
       return parsed as unknown as LeaveMessage;

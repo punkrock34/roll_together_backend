@@ -1,6 +1,10 @@
 import { randomBytes } from "node:crypto";
 
-import type { ParticipantPresence, PlaybackSnapshot } from "./protocol";
+import type {
+  ParticipantPresence,
+  PlaybackSnapshot,
+  RoomMutationErrorCode,
+} from "./protocol";
 
 interface ParticipantRecord {
   sessionId: string;
@@ -22,7 +26,26 @@ export interface RoomStoreSnapshot {
   playback: PlaybackSnapshot;
   participants: ParticipantPresence[];
   participantCount: number;
+  hostSessionId: string;
 }
+
+export interface JoinResult extends RoomStoreSnapshot {
+  sessionId: string;
+  createdRoom: boolean;
+  episodeChanged: boolean;
+}
+
+interface MutationSuccess {
+  ok: true;
+  snapshot: RoomStoreSnapshot;
+}
+
+interface MutationFailure {
+  ok: false;
+  code: RoomMutationErrorCode;
+}
+
+export type RoomMutationResult = MutationSuccess | MutationFailure;
 
 interface RoomStoreOptions {
   roomTtlMs: number;
@@ -41,19 +64,23 @@ export class RoomStore {
 
   constructor(private readonly options: RoomStoreOptions) {}
 
-  join(input: JoinInput): RoomStoreSnapshot & { sessionId: string } {
+  join(input: JoinInput): JoinResult {
     const now = input.now ?? Date.now();
     const roomId = input.roomId ?? this.createId(8);
-    const room =
-      this.rooms.get(roomId) ?? this.createRoom(roomId, input.playback, now);
+    const existingRoom = this.rooms.get(roomId);
+    const createdRoom = !existingRoom;
+    const room = existingRoom ?? this.createRoom(roomId, input.playback, now);
+    const previousPlayback = createdRoom
+      ? undefined
+      : this.resolvePlayback(room, now);
 
     const participant = input.sessionId
       ? room.participants.get(input.sessionId)
       : undefined;
     const sessionId =
       participant?.sessionId ?? input.sessionId ?? this.createId(12);
-
     const joinedAt = participant?.joinedAt ?? now;
+
     room.participants.set(sessionId, {
       sessionId,
       joinedAt,
@@ -62,19 +89,30 @@ export class RoomStore {
     });
 
     room.lastActivityAt = now;
-    if (this.resolvePlayback(room, now).updatedAt < input.playback.updatedAt) {
-      room.playback = { ...input.playback, updatedAt: now };
-    }
-
-    if (
-      !room.hostSessionId ||
-      !room.participants.get(room.hostSessionId)?.connected
-    ) {
+    if (!room.hostSessionId) {
       room.hostSessionId = sessionId;
     }
 
+    const isHost = room.hostSessionId === sessionId;
+    let episodeChanged = false;
+
+    if (createdRoom) {
+      room.playback = { ...input.playback, updatedAt: now };
+    } else if (
+      isHost &&
+      shouldAcceptPlaybackUpdate(previousPlayback, input.playback)
+    ) {
+      episodeChanged =
+        previousPlayback?.episodeUrl !== input.playback.episodeUrl;
+      room.playback = { ...input.playback, updatedAt: now };
+    }
+
+    this.promoteHost(room);
+
     return {
       sessionId,
+      createdRoom,
+      episodeChanged,
       ...this.snapshotRoom(room, now),
     };
   }
@@ -84,22 +122,17 @@ export class RoomStore {
     sessionId: string,
     playback: PlaybackSnapshot,
     now = Date.now(),
-  ) {
-    const room = this.rooms.get(roomId);
-    if (!room || !room.participants.has(sessionId)) {
-      return undefined;
-    }
+  ): RoomMutationResult {
+    return this.applyHostPlayback(roomId, sessionId, playback, now);
+  }
 
-    room.playback = { ...playback, updatedAt: now };
-    room.lastActivityAt = now;
-
-    const participant = room.participants.get(sessionId);
-    if (participant) {
-      participant.connected = true;
-      participant.lastSeenAt = now;
-    }
-
-    return this.snapshotRoom(room, now);
+  navigate(
+    roomId: string,
+    sessionId: string,
+    playback: PlaybackSnapshot,
+    now = Date.now(),
+  ): RoomMutationResult {
+    return this.applyHostPlayback(roomId, sessionId, playback, now);
   }
 
   getSnapshot(roomId: string, now = Date.now()) {
@@ -187,6 +220,40 @@ export class RoomStore {
     return count;
   }
 
+  private applyHostPlayback(
+    roomId: string,
+    sessionId: string,
+    playback: PlaybackSnapshot,
+    now: number,
+  ): RoomMutationResult {
+    const room = this.rooms.get(roomId);
+    if (!room) {
+      return { ok: false, code: "unknown_room" };
+    }
+
+    const participant = room.participants.get(sessionId);
+    if (!participant) {
+      return { ok: false, code: "not_joined" };
+    }
+
+    if (room.hostSessionId !== sessionId) {
+      participant.connected = true;
+      participant.lastSeenAt = now;
+      room.lastActivityAt = now;
+      return { ok: false, code: "not_host" };
+    }
+
+    participant.connected = true;
+    participant.lastSeenAt = now;
+    room.lastActivityAt = now;
+    room.playback = { ...playback, updatedAt: now };
+
+    return {
+      ok: true,
+      snapshot: this.snapshotRoom(room, now),
+    };
+  }
+
   private createRoom(roomId: string, playback: PlaybackSnapshot, now: number) {
     const room: RoomRecord = {
       roomId,
@@ -217,6 +284,7 @@ export class RoomStore {
       playback: this.resolvePlayback(room, now),
       participants,
       participantCount: participants.length,
+      hostSessionId: room.hostSessionId,
     };
   }
 
@@ -253,4 +321,22 @@ export class RoomStore {
   private createId(length: number) {
     return randomBytes(length).toString("base64url").slice(0, length);
   }
+}
+
+function shouldAcceptPlaybackUpdate(
+  currentPlayback: PlaybackSnapshot | undefined,
+  nextPlayback: PlaybackSnapshot,
+) {
+  if (!currentPlayback) {
+    return true;
+  }
+
+  return (
+    currentPlayback.episodeUrl !== nextPlayback.episodeUrl ||
+    currentPlayback.state !== nextPlayback.state ||
+    Math.abs(currentPlayback.currentTime - nextPlayback.currentTime) > 0.05 ||
+    currentPlayback.playbackRate !== nextPlayback.playbackRate ||
+    currentPlayback.duration !== nextPlayback.duration ||
+    currentPlayback.updatedAt < nextPlayback.updatedAt
+  );
 }

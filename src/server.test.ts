@@ -1,8 +1,8 @@
 import { describe, expect, it } from "vitest";
 
-import { buildHealthPayload, buildVersionPayload } from "./server";
 import { PROTOCOL_VERSION, parseClientMessage } from "./protocol";
 import { RoomStore } from "./room-store";
+import { buildHealthPayload, buildVersionPayload } from "./server";
 
 describe("backend server", () => {
   it("builds health and version payloads for operational endpoints", () => {
@@ -18,8 +18,8 @@ describe("backend server", () => {
     expect(version.protocolVersion).toBe(PROTOCOL_VERSION);
   });
 
-  it("parses a valid join message for the websocket protocol", () => {
-    const message = parseClientMessage(
+  it("parses valid join and navigate websocket messages", () => {
+    const joinMessage = parseClientMessage(
       JSON.stringify({
         type: "join",
         version: PROTOCOL_VERSION,
@@ -38,9 +38,27 @@ describe("backend server", () => {
       }),
     );
 
-    expect(message?.type).toBe("join");
-    expect(message && "roomId" in message ? message.roomId : undefined).toBe(
-      "room-1",
+    const navigateMessage = parseClientMessage(
+      JSON.stringify({
+        type: "navigate",
+        version: PROTOCOL_VERSION,
+        playback: {
+          provider: "crunchyroll",
+          episodeTitle: "Episode 2",
+          episodeUrl: "https://www.crunchyroll.com/watch/example-2",
+          state: "paused",
+          currentTime: 0,
+          duration: 24,
+          playbackRate: 1,
+          updatedAt: Date.now(),
+        },
+      }),
     );
+
+    expect(joinMessage?.type).toBe("join");
+    expect(
+      joinMessage && "roomId" in joinMessage ? joinMessage.roomId : undefined,
+    ).toBe("room-1");
+    expect(navigateMessage?.type).toBe("navigate");
   });
 });

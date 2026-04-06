@@ -10,13 +10,15 @@ import {
   parseClientMessage,
   type ErrorMessage,
   type JoinedMessage,
+  type NavigateBroadcastMessage,
   type PingMessage,
   type PongMessage,
   type PresenceMessage,
+  type RoomMutationErrorCode,
   type ServerMessage,
   type SyncBroadcastMessage,
 } from "./protocol";
-import { RoomStore } from "./room-store";
+import { RoomStore, type JoinResult } from "./room-store";
 
 interface SocketContext {
   roomId?: string;
@@ -71,7 +73,11 @@ export function createRollTogetherServer(config: AppConfig = getConfig()) {
     }
   };
 
-  const sendError = (socket: WebSocket, code: string, message: string) => {
+  const sendError = (
+    socket: WebSocket,
+    code: ErrorMessage["code"],
+    message: string,
+  ) => {
     const payload: ErrorMessage = {
       type: "error",
       version: PROTOCOL_VERSION,
@@ -79,6 +85,34 @@ export function createRollTogetherServer(config: AppConfig = getConfig()) {
       message,
     };
     send(socket, payload);
+  };
+
+  const messageForMutationError = (code: RoomMutationErrorCode) => {
+    switch (code) {
+      case "unknown_room":
+        return "The room no longer exists.";
+      case "not_joined":
+        return "Join a room before sending room updates.";
+      case "not_host":
+        return "Only the current host can control this room.";
+    }
+  };
+
+  const broadcastToRoom = (
+    roomId: string,
+    buildMessage: (context: SocketContext) => ServerMessage | undefined,
+  ) => {
+    for (const client of wsServer.clients) {
+      const context = socketContexts.get(client);
+      if (!context || context.roomId !== roomId) {
+        continue;
+      }
+
+      const payload = buildMessage(context);
+      if (payload) {
+        send(client, payload);
+      }
+    }
   };
 
   const broadcastPresence = (roomId: string) => {
@@ -93,14 +127,34 @@ export function createRollTogetherServer(config: AppConfig = getConfig()) {
       roomId,
       participantCount: snapshot.participantCount,
       participants: snapshot.participants,
+      hostSessionId: snapshot.hostSessionId,
     };
 
-    for (const client of wsServer.clients) {
-      const context = socketContexts.get(client);
-      if (context?.roomId === roomId) {
-        send(client, payload);
+    broadcastToRoom(roomId, () => payload);
+  };
+
+  const broadcastNavigation = (
+    joined: JoinResult,
+    participantId: string,
+    excludeSessionId?: string,
+  ) => {
+    const payload: NavigateBroadcastMessage = {
+      type: "navigate",
+      version: PROTOCOL_VERSION,
+      roomId: joined.roomId,
+      participantId,
+      participantCount: joined.participantCount,
+      participants: joined.participants,
+      hostSessionId: joined.hostSessionId,
+      playback: joined.playback,
+    };
+
+    broadcastToRoom(joined.roomId, (context) => {
+      if (context.sessionId === excludeSessionId) {
+        return undefined;
       }
-    }
+      return payload;
+    });
   };
 
   wsServer.on("connection", (socket) => {
@@ -121,6 +175,9 @@ export function createRollTogetherServer(config: AppConfig = getConfig()) {
 
       switch (message.type) {
         case "join": {
+          const roomBeforeJoin = message.roomId
+            ? store.getSnapshot(message.roomId)
+            : undefined;
           const joined = store.join({
             roomId: message.roomId,
             sessionId: message.sessionId,
@@ -139,10 +196,20 @@ export function createRollTogetherServer(config: AppConfig = getConfig()) {
             sessionId: joined.sessionId,
             participantCount: joined.participantCount,
             participants: joined.participants,
+            hostSessionId: joined.hostSessionId,
             playback: joined.playback,
           };
 
           send(socket, payload);
+
+          const switchedEpisode =
+            Boolean(roomBeforeJoin) &&
+            joined.episodeChanged &&
+            joined.hostSessionId === joined.sessionId;
+          if (switchedEpisode) {
+            broadcastNavigation(joined, joined.sessionId, joined.sessionId);
+          }
+
           broadcastPresence(joined.roomId);
           break;
         }
@@ -151,18 +218,22 @@ export function createRollTogetherServer(config: AppConfig = getConfig()) {
             sendError(
               socket,
               "not_joined",
-              "Join a room before sending sync events.",
+              "Join a room before sending room updates.",
             );
             return;
           }
 
-          const snapshot = store.sync(
+          const result = store.sync(
             context.roomId,
             context.sessionId,
             message.playback,
           );
-          if (!snapshot) {
-            sendError(socket, "unknown_room", "The room no longer exists.");
+          if (!result.ok) {
+            sendError(
+              socket,
+              result.code,
+              messageForMutationError(result.code),
+            );
             return;
           }
 
@@ -171,19 +242,61 @@ export function createRollTogetherServer(config: AppConfig = getConfig()) {
             version: PROTOCOL_VERSION,
             roomId: context.roomId,
             participantId: context.sessionId,
-            participantCount: snapshot.participantCount,
-            playback: snapshot.playback,
+            participantCount: result.snapshot.participantCount,
+            participants: result.snapshot.participants,
+            hostSessionId: result.snapshot.hostSessionId,
+            playback: result.snapshot.playback,
           };
 
-          for (const client of wsServer.clients) {
-            const clientContext = socketContexts.get(client);
-            if (
-              clientContext?.roomId === context.roomId &&
-              clientContext.sessionId !== context.sessionId
-            ) {
-              send(client, payload);
+          broadcastToRoom(context.roomId, (clientContext) => {
+            if (clientContext.sessionId === context.sessionId) {
+              return undefined;
             }
+            return payload;
+          });
+          break;
+        }
+        case "navigate": {
+          if (!context.roomId || !context.sessionId) {
+            sendError(
+              socket,
+              "not_joined",
+              "Join a room before sending room updates.",
+            );
+            return;
           }
+
+          const result = store.navigate(
+            context.roomId,
+            context.sessionId,
+            message.playback,
+          );
+          if (!result.ok) {
+            sendError(
+              socket,
+              result.code,
+              messageForMutationError(result.code),
+            );
+            return;
+          }
+
+          const payload: NavigateBroadcastMessage = {
+            type: "navigate",
+            version: PROTOCOL_VERSION,
+            roomId: context.roomId,
+            participantId: context.sessionId,
+            participantCount: result.snapshot.participantCount,
+            participants: result.snapshot.participants,
+            hostSessionId: result.snapshot.hostSessionId,
+            playback: result.snapshot.playback,
+          };
+
+          broadcastToRoom(context.roomId, (clientContext) => {
+            if (clientContext.sessionId === context.sessionId) {
+              return undefined;
+            }
+            return payload;
+          });
           break;
         }
         case "leave": {

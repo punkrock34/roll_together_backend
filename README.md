@@ -1,108 +1,70 @@
-# Roll Together v2 Backend
+# Roll Together Backend
 
-Roll Together v2 Backend is the self-hostable realtime service that powers anonymous watch parties for the Roll Together browser extension.
+![CI](https://github.com/punkrock34/roll_together_backend/actions/workflows/ci.yml/badge.svg)
+![License](https://img.shields.io/badge/license-MIT-green)
+![Status](https://img.shields.io/badge/status-active-blue)
 
-## Project Lineage
+This repository contains the self-hostable realtime backend used by the Roll Together extension.
 
-This backend continues the original work from SamuraiExx's [`roll_together_backend`](https://github.com/samuraiexx/roll_together_backend) repository. The project remains MIT-licensed, and the original README has been preserved in [README.legacy.md](README.legacy.md).
+---
 
-## v2 Goals
+## Overview
 
-- Typed WebSocket room protocol instead of the original Socket.IO flow.
-- Versioned health and version endpoints for easier operations.
-- In-memory rooms with reconnect handling and TTL cleanup.
-- Simple self-hosting story with Docker Compose and `.env` configuration.
-- Browser-extension-friendly defaults with no required accounts.
+The backend provides realtime synchronization between clients using a lightweight, self-hostable service designed for low-latency communication.
 
-## API Surface
+---
 
-- `GET /health`
-- `GET /version`
-- `WS /ws`
+## Attribution
 
-The WebSocket contract supports `join`, `sync`, `presence`, `leave`, `ping`, and `pong`.
+This backend continues work originally published by SamuraiExx in:
 
-## Development
+- https://github.com/samuraiexx/roll_together_backend
 
-### Prerequisites
+The project remains MIT-licensed, and that attribution is preserved as part of this continuation.
 
-- Node.js 20+
-- npm 10+
+---
 
-### Install
+## Changes in This Fork
 
-```bash
-npm install
-```
+- refactored structure for clarity and maintainability
+- improved local development and deployment flow
+- prepared for future feature extensions and scaling
 
-### Local Development
+---
+
+## Quick Start
 
 ```bash
 cp .env.example .env
-npm run dev
+docker compose up -d --build
 ```
 
-The server listens on `http://localhost:3000` by default.
-
-### Quality Checks
-
-```bash
-npm run lint
-npm run check
-npm run test
-```
-
-## Docker Compose
-
-```bash
-cp .env.example .env
-docker compose up --build
-```
-
-Health endpoint:
+Health check:
 
 ```bash
 curl http://localhost:3000/health
 ```
 
-If port `3000` is already in use on your host, keep the app listening on
-container port `3000` and change only the published host port in `.env`:
+---
 
-```env
-HOST_PORT=3001
-PORT=3000
-```
-
-Then start the stack again:
+## Local Development
 
 ```bash
-docker compose up -d --build
+npm install
+npm run dev
 ```
 
-Your health check would then be:
+---
 
-```bash
-curl http://localhost:3001/health
-```
+## Docs
 
-## Configuration
+- [API and protocol notes](docs/api.md)
+- [Deployment and configuration](docs/deployment.md)
+- Reverse proxy example: [docs/nginx.conf](docs/nginx.conf)
+- Apache reverse proxy example: [docs/apache.conf](docs/apache.conf)
 
-See `.env.example` for the supported settings:
+---
 
-- `HOST_PORT`
-- `PORT`
-- `HOST`
-- `ROOM_TTL_MS`
-- `RECONNECT_GRACE_MS`
-- `CORS_ORIGIN`
+## License
 
-## Manual Self-Host Flow
-
-1. Start this backend locally with Docker Compose or `npm run dev`.
-2. In the extension repo, set the backend URLs to `http://localhost:3000` and `ws://localhost:3000/ws`.
-3. Load the unpacked extension in Chrome or Firefox.
-4. Open the same Crunchyroll episode in two windows and verify room sync.
-
-## Reverse Proxy
-
-A sample Nginx config is included at [docs/nginx.conf](docs/nginx.conf).
+MIT — see [LICENSE](./LICENSE)
