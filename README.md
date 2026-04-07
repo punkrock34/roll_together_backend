@@ -64,6 +64,8 @@ npm run dev
 - Reverse proxy example: [docs/nginx.conf](docs/nginx.conf)
 - Apache reverse proxy example: [docs/apache.conf](docs/apache.conf)
 
+If you are new to self-hosting, start with [docs/self-hosting.md](docs/self-hosting.md). It explains the difference between using a VPS, a spare machine at home, or your current PC, and it includes a full beginner-friendly setup path.
+
 ---
 
 ## License

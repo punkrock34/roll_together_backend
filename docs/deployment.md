@@ -1,5 +1,7 @@
 # Deployment
 
+If you are completely new to self-hosting, read [self-hosting.md](self-hosting.md) first. That guide starts with setup choices and plain-language explanations before getting into the deployment details here.
+
 ## Requirements
 
 - Node.js 20+ for local development
@@ -40,6 +42,7 @@ curl http://localhost:11420/health
 
 - A sample Nginx config lives in [nginx.conf](nginx.conf).
 - A sample Apache config lives in [apache.conf](apache.conf).
+- Home-hosted setups can also use a tunnel instead of router port forwarding.
 - If you expose the backend through a reverse proxy or tunnel, the extension should use:
   - `https://your-domain`
   - `wss://your-domain/ws`
