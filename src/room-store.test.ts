@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import type { PlaybackSnapshot } from "./protocol";
-import { RoomStore } from "./room-store";
+import { createRoomStore } from "./room-store";
 
 const playback: PlaybackSnapshot = {
   provider: "crunchyroll",
@@ -14,9 +14,9 @@ const playback: PlaybackSnapshot = {
   updatedAt: 1,
 };
 
-describe("RoomStore", () => {
+describe("room store", () => {
   it("reuses a session id when a participant reconnects", () => {
-    const store = new RoomStore({
+    const store = createRoomStore({
       roomTtlMs: 60_000,
       reconnectGraceMs: 30_000,
     });
@@ -41,7 +41,7 @@ describe("RoomStore", () => {
   });
 
   it("rejects follower sync attempts and keeps the host authoritative", () => {
-    const store = new RoomStore({
+    const store = createRoomStore({
       roomTtlMs: 60_000,
       reconnectGraceMs: 30_000,
     });
@@ -72,7 +72,7 @@ describe("RoomStore", () => {
   });
 
   it("lets the host switch the room to a new episode", () => {
-    const store = new RoomStore({
+    const store = createRoomStore({
       roomTtlMs: 60_000,
       reconnectGraceMs: 30_000,
     });
@@ -104,7 +104,7 @@ describe("RoomStore", () => {
   });
 
   it("stores participant display names in presence snapshots", () => {
-    const store = new RoomStore({
+    const store = createRoomStore({
       roomTtlMs: 60_000,
       reconnectGraceMs: 30_000,
     });
@@ -129,8 +129,116 @@ describe("RoomStore", () => {
     ).toEqual(["PunkRock", "Friend"]);
   });
 
+  it("transfers host to a connected follower and preserves canonical playback", () => {
+    const store = createRoomStore({
+      roomTtlMs: 60_000,
+      reconnectGraceMs: 30_000,
+    });
+
+    store.join({
+      roomId: "room-1",
+      playback: { ...playback, state: "playing", currentTime: 15 },
+      sessionId: "host-1",
+      now: 100,
+    });
+    store.join({
+      roomId: "room-1",
+      playback,
+      sessionId: "viewer-1",
+      now: 120,
+    });
+
+    const result = store.transferHost("room-1", "host-1", "viewer-1", 140);
+
+    expect(result.ok).toBe(true);
+    expect(result.ok ? result.previousHostSessionId : undefined).toBe("host-1");
+    expect(result.ok ? result.snapshot.hostSessionId : undefined).toBe(
+      "viewer-1",
+    );
+    expect(result.ok ? result.snapshot.playback.updatedAt : undefined).toBe(
+      140,
+    );
+    expect(
+      result.ok ? result.snapshot.playback.currentTime : undefined,
+    ).toBeCloseTo(15.04, 2);
+  });
+
+  it("rejects invalid host transfer targets", () => {
+    const store = createRoomStore({
+      roomTtlMs: 60_000,
+      reconnectGraceMs: 30_000,
+    });
+
+    store.join({
+      roomId: "room-1",
+      playback,
+      sessionId: "host-1",
+      now: 100,
+    });
+    store.join({
+      roomId: "room-1",
+      playback,
+      sessionId: "viewer-1",
+      now: 120,
+    });
+    store.join({
+      roomId: "room-1",
+      playback,
+      sessionId: "viewer-2",
+      now: 130,
+    });
+    store.markDisconnected("room-1", "viewer-2", 135);
+
+    expect(store.transferHost("room-1", "host-1", "host-1", 140)).toEqual({
+      ok: false,
+      code: "invalid_transfer_target",
+    });
+    expect(store.transferHost("room-1", "viewer-1", "host-1", 150)).toEqual({
+      ok: false,
+      code: "not_host",
+    });
+    expect(store.transferHost("room-1", "host-1", "missing", 160)).toEqual({
+      ok: false,
+      code: "invalid_transfer_target",
+    });
+    expect(store.transferHost("room-1", "host-1", "viewer-2", 170)).toEqual({
+      ok: false,
+      code: "invalid_transfer_target",
+    });
+  });
+
+  it("promotes the next connected participant when the host disconnects", () => {
+    const store = createRoomStore({
+      roomTtlMs: 60_000,
+      reconnectGraceMs: 30_000,
+    });
+
+    store.join({
+      roomId: "room-1",
+      playback,
+      sessionId: "host-1",
+      now: 100,
+    });
+    store.join({
+      roomId: "room-1",
+      playback,
+      sessionId: "viewer-1",
+      now: 120,
+    });
+    store.join({
+      roomId: "room-1",
+      playback,
+      sessionId: "viewer-2",
+      now: 140,
+    });
+
+    const snapshot = store.markDisconnected("room-1", "host-1", 160);
+
+    expect(snapshot?.hostSessionId).toBe("viewer-1");
+  });
+
   it("removes an empty room immediately after the last participant leaves", () => {
-    const store = new RoomStore({ roomTtlMs: 50, reconnectGraceMs: 10 });
+    const store = createRoomStore({ roomTtlMs: 50, reconnectGraceMs: 10 });
     store.join({ roomId: "room-2", playback, sessionId: "session-2", now: 0 });
     store.leave("room-2", "session-2", 10);
 

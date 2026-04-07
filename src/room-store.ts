@@ -1,44 +1,23 @@
-import { randomBytes } from "node:crypto";
-
-import type {
-  ParticipantPresence,
-  PlaybackSnapshot,
-  RoomMutationErrorCode,
-} from "./protocol";
-
-interface ParticipantRecord {
-  sessionId: string;
-  displayName: string;
-  joinedAt: number;
-  lastSeenAt: number;
-  connected: boolean;
-}
-
-interface RoomRecord {
-  roomId: string;
-  hostSessionId: string;
-  playback: PlaybackSnapshot;
-  participants: Map<string, ParticipantRecord>;
-  lastActivityAt: number;
-}
-
-export interface RoomStoreSnapshot {
-  roomId: string;
-  playback: PlaybackSnapshot;
-  participants: ParticipantPresence[];
-  participantCount: number;
-  hostSessionId: string;
-}
-
-export interface JoinResult extends RoomStoreSnapshot {
-  sessionId: string;
-  createdRoom: boolean;
-  episodeChanged: boolean;
-}
+import type { PlaybackSnapshot, RoomMutationErrorCode } from "./protocol";
+import {
+  createId,
+  createRoomRecord,
+  promoteHost,
+  resolveParticipantDisplayName,
+  resolvePlayback,
+  shouldAcceptPlaybackUpdate,
+  snapshotRoom,
+  type JoinResult,
+  type RoomStoreSnapshot,
+} from "./room-state";
 
 interface MutationSuccess {
   ok: true;
   snapshot: RoomStoreSnapshot;
+}
+
+interface TransferHostSuccess extends MutationSuccess {
+  previousHostSessionId: string;
 }
 
 interface MutationFailure {
@@ -47,8 +26,9 @@ interface MutationFailure {
 }
 
 export type RoomMutationResult = MutationSuccess | MutationFailure;
+export type TransferHostResult = TransferHostSuccess | MutationFailure;
 
-interface RoomStoreOptions {
+export interface RoomStoreOptions {
   roomTtlMs: number;
   reconnectGraceMs: number;
 }
@@ -61,180 +41,61 @@ interface JoinInput {
   now?: number;
 }
 
-export class RoomStore {
-  private readonly rooms = new Map<string, RoomRecord>();
-
-  constructor(private readonly options: RoomStoreOptions) {}
-
-  join(input: JoinInput): JoinResult {
-    const now = input.now ?? Date.now();
-    const roomId = input.roomId ?? this.createId(8);
-    const existingRoom = this.rooms.get(roomId);
-    const createdRoom = !existingRoom;
-    const room = existingRoom ?? this.createRoom(roomId, input.playback, now);
-    const previousPlayback = createdRoom
-      ? undefined
-      : this.resolvePlayback(room, now);
-
-    const participant = input.sessionId
-      ? room.participants.get(input.sessionId)
-      : undefined;
-    const sessionId =
-      participant?.sessionId ?? input.sessionId ?? this.createId(12);
-    const joinedAt = participant?.joinedAt ?? now;
-    const displayName = resolveParticipantDisplayName(
-      input.displayName,
-      participant?.displayName,
-      sessionId,
-    );
-
-    room.participants.set(sessionId, {
-      sessionId,
-      displayName,
-      joinedAt,
-      lastSeenAt: now,
-      connected: true,
-    });
-
-    room.lastActivityAt = now;
-    if (!room.hostSessionId) {
-      room.hostSessionId = sessionId;
-    }
-
-    const isHost = room.hostSessionId === sessionId;
-    let episodeChanged = false;
-
-    if (createdRoom) {
-      room.playback = { ...input.playback, updatedAt: now };
-    } else if (
-      isHost &&
-      shouldAcceptPlaybackUpdate(previousPlayback, input.playback)
-    ) {
-      episodeChanged =
-        previousPlayback?.episodeUrl !== input.playback.episodeUrl;
-      room.playback = { ...input.playback, updatedAt: now };
-    }
-
-    this.promoteHost(room);
-
-    return {
-      sessionId,
-      createdRoom,
-      episodeChanged,
-      ...this.snapshotRoom(room, now),
-    };
-  }
-
+export interface RoomStore {
+  join(input: JoinInput): JoinResult;
   sync(
     roomId: string,
     sessionId: string,
     playback: PlaybackSnapshot,
-    now = Date.now(),
-  ): RoomMutationResult {
-    return this.applyHostPlayback(roomId, sessionId, playback, now);
-  }
-
+    now?: number,
+  ): RoomMutationResult;
   navigate(
     roomId: string,
     sessionId: string,
     playback: PlaybackSnapshot,
-    now = Date.now(),
-  ): RoomMutationResult {
-    return this.applyHostPlayback(roomId, sessionId, playback, now);
-  }
+    now?: number,
+  ): RoomMutationResult;
+  transferHost(
+    roomId: string,
+    sessionId: string,
+    targetSessionId: string,
+    now?: number,
+  ): TransferHostResult;
+  getSnapshot(roomId: string, now?: number): RoomStoreSnapshot | undefined;
+  markDisconnected(
+    roomId: string,
+    sessionId: string,
+    now?: number,
+  ): RoomStoreSnapshot | undefined;
+  leave(
+    roomId: string,
+    sessionId: string,
+    now?: number,
+  ): RoomStoreSnapshot | undefined;
+  prune(now?: number): string[];
+  getRoomCount(): number;
+  getConnectedParticipantCount(): number;
+}
 
-  getSnapshot(roomId: string, now = Date.now()) {
-    const room = this.rooms.get(roomId);
+export function createRoomStore(options: RoomStoreOptions): RoomStore {
+  const rooms = new Map<string, ReturnType<typeof createRoomRecord>>();
+
+  const getSnapshot = (roomId: string, now = Date.now()) => {
+    const room = rooms.get(roomId);
     if (!room) {
       return undefined;
     }
 
-    return this.snapshotRoom(room, now);
-  }
+    return snapshotRoom(room, now);
+  };
 
-  markDisconnected(roomId: string, sessionId: string, now = Date.now()) {
-    const room = this.rooms.get(roomId);
-    if (!room) {
-      return undefined;
-    }
-
-    const participant = room.participants.get(sessionId);
-    if (participant) {
-      participant.connected = false;
-      participant.lastSeenAt = now;
-      room.lastActivityAt = now;
-    }
-
-    this.promoteHost(room);
-    return this.snapshotRoom(room, now);
-  }
-
-  leave(roomId: string, sessionId: string, now = Date.now()) {
-    const room = this.rooms.get(roomId);
-    if (!room) {
-      return undefined;
-    }
-
-    room.participants.delete(sessionId);
-    room.lastActivityAt = now;
-    this.promoteHost(room);
-
-    if (room.participants.size === 0) {
-      this.rooms.delete(roomId);
-      return undefined;
-    }
-
-    return this.snapshotRoom(room, now);
-  }
-
-  prune(now = Date.now()) {
-    const removedRooms: string[] = [];
-
-    for (const [roomId, room] of this.rooms) {
-      for (const [sessionId, participant] of room.participants) {
-        if (
-          !participant.connected &&
-          now - participant.lastSeenAt > this.options.reconnectGraceMs
-        ) {
-          room.participants.delete(sessionId);
-        }
-      }
-
-      this.promoteHost(room);
-
-      if (
-        room.participants.size === 0 &&
-        now - room.lastActivityAt > this.options.roomTtlMs
-      ) {
-        this.rooms.delete(roomId);
-        removedRooms.push(roomId);
-      }
-    }
-
-    return removedRooms;
-  }
-
-  getRoomCount() {
-    return this.rooms.size;
-  }
-
-  getConnectedParticipantCount() {
-    let count = 0;
-    for (const room of this.rooms.values()) {
-      count += Array.from(room.participants.values()).filter(
-        (participant) => participant.connected,
-      ).length;
-    }
-    return count;
-  }
-
-  private applyHostPlayback(
+  const applyHostPlayback = (
     roomId: string,
     sessionId: string,
     playback: PlaybackSnapshot,
     now: number,
-  ): RoomMutationResult {
-    const room = this.rooms.get(roomId);
+  ): RoomMutationResult => {
+    const room = rooms.get(roomId);
     if (!room) {
       return { ok: false, code: "unknown_room" };
     }
@@ -258,111 +119,207 @@ export class RoomStore {
 
     return {
       ok: true,
-      snapshot: this.snapshotRoom(room, now),
+      snapshot: snapshotRoom(room, now),
     };
-  }
+  };
 
-  private createRoom(roomId: string, playback: PlaybackSnapshot, now: number) {
-    const room: RoomRecord = {
-      roomId,
-      hostSessionId: "",
-      playback: { ...playback, updatedAt: now },
-      participants: new Map(),
-      lastActivityAt: now,
-    };
+  return {
+    join(input) {
+      const now = input.now ?? Date.now();
+      const roomId = input.roomId ?? createId(8);
+      const existingRoom = rooms.get(roomId);
+      const createdRoom = !existingRoom;
+      const room =
+        existingRoom ?? createRoomRecord(roomId, input.playback, now);
+      const previousPlayback = createdRoom
+        ? undefined
+        : resolvePlayback(room, now);
 
-    this.rooms.set(roomId, room);
-    return room;
-  }
+      if (!existingRoom) {
+        rooms.set(roomId, room);
+      }
 
-  private snapshotRoom(room: RoomRecord, now: number): RoomStoreSnapshot {
-    const participants = Array.from(room.participants.values())
-      .filter((participant) => participant.connected)
-      .map<ParticipantPresence>((participant) => ({
-        sessionId: participant.sessionId,
-        displayName: participant.displayName,
-        isHost: participant.sessionId === room.hostSessionId,
-        joinedAt: participant.joinedAt,
-        lastSeenAt: participant.lastSeenAt,
-        connected: participant.connected,
-      }))
-      .sort((left, right) => left.joinedAt - right.joinedAt);
+      const participant = input.sessionId
+        ? room.participants.get(input.sessionId)
+        : undefined;
+      const sessionId =
+        participant?.sessionId ?? input.sessionId ?? createId(12);
+      const joinedAt = participant?.joinedAt ?? now;
+      const displayName = resolveParticipantDisplayName(
+        input.displayName,
+        participant?.displayName,
+        sessionId,
+      );
 
-    return {
-      roomId: room.roomId,
-      playback: this.resolvePlayback(room, now),
-      participants,
-      participantCount: participants.length,
-      hostSessionId: room.hostSessionId,
-    };
-  }
+      room.participants.set(sessionId, {
+        sessionId,
+        displayName,
+        joinedAt,
+        lastSeenAt: now,
+        connected: true,
+      });
 
-  private resolvePlayback(room: RoomRecord, now: number): PlaybackSnapshot {
-    if (room.playback.state !== "playing") {
-      return room.playback;
-    }
+      room.lastActivityAt = now;
+      if (!room.hostSessionId) {
+        room.hostSessionId = sessionId;
+      }
 
-    const elapsedSeconds = Math.max(0, (now - room.playback.updatedAt) / 1000);
-    const currentTime =
-      room.playback.currentTime +
-      elapsedSeconds * Math.max(room.playback.playbackRate, 1);
+      const isHost = room.hostSessionId === sessionId;
+      let episodeChanged = false;
 
-    return {
-      ...room.playback,
-      currentTime,
-      updatedAt: now,
-    };
-  }
+      if (createdRoom) {
+        room.playback = { ...input.playback, updatedAt: now };
+      } else if (
+        isHost &&
+        shouldAcceptPlaybackUpdate(previousPlayback, input.playback)
+      ) {
+        episodeChanged =
+          previousPlayback?.episodeUrl !== input.playback.episodeUrl;
+        room.playback = { ...input.playback, updatedAt: now };
+      }
 
-  private promoteHost(room: RoomRecord) {
-    const currentHost = room.participants.get(room.hostSessionId);
-    if (currentHost?.connected) {
-      return;
-    }
+      promoteHost(room);
 
-    const nextHost = Array.from(room.participants.values())
-      .filter((participant) => participant.connected)
-      .sort((left, right) => left.joinedAt - right.joinedAt)[0];
+      return {
+        sessionId,
+        createdRoom,
+        episodeChanged,
+        ...snapshotRoom(room, now),
+      };
+    },
 
-    room.hostSessionId = nextHost?.sessionId ?? "";
-  }
+    sync(roomId, sessionId, playback, now = Date.now()) {
+      return applyHostPlayback(roomId, sessionId, playback, now);
+    },
 
-  private createId(length: number) {
-    return randomBytes(length).toString("base64url").slice(0, length);
-  }
+    navigate(roomId, sessionId, playback, now = Date.now()) {
+      return applyHostPlayback(roomId, sessionId, playback, now);
+    },
+
+    transferHost(roomId, sessionId, targetSessionId, now = Date.now()) {
+      const room = rooms.get(roomId);
+      if (!room) {
+        return { ok: false, code: "unknown_room" };
+      }
+
+      const currentHost = room.participants.get(sessionId);
+      if (!currentHost) {
+        return { ok: false, code: "not_joined" };
+      }
+
+      currentHost.connected = true;
+      currentHost.lastSeenAt = now;
+      room.lastActivityAt = now;
+
+      if (room.hostSessionId !== sessionId) {
+        return { ok: false, code: "not_host" };
+      }
+
+      if (sessionId === targetSessionId) {
+        return { ok: false, code: "invalid_transfer_target" };
+      }
+
+      const target = room.participants.get(targetSessionId);
+      if (
+        !target ||
+        !target.connected ||
+        room.hostSessionId === targetSessionId
+      ) {
+        return { ok: false, code: "invalid_transfer_target" };
+      }
+
+      target.lastSeenAt = now;
+      room.lastActivityAt = now;
+      room.playback = resolvePlayback(room, now);
+
+      const previousHostSessionId = room.hostSessionId;
+      room.hostSessionId = targetSessionId;
+
+      return {
+        ok: true,
+        previousHostSessionId,
+        snapshot: snapshotRoom(room, now),
+      };
+    },
+
+    getSnapshot,
+
+    markDisconnected(roomId, sessionId, now = Date.now()) {
+      const room = rooms.get(roomId);
+      if (!room) {
+        return undefined;
+      }
+
+      const participant = room.participants.get(sessionId);
+      if (participant) {
+        participant.connected = false;
+        participant.lastSeenAt = now;
+        room.lastActivityAt = now;
+      }
+
+      promoteHost(room);
+      return snapshotRoom(room, now);
+    },
+
+    leave(roomId, sessionId, now = Date.now()) {
+      const room = rooms.get(roomId);
+      if (!room) {
+        return undefined;
+      }
+
+      room.participants.delete(sessionId);
+      room.lastActivityAt = now;
+      promoteHost(room);
+
+      if (room.participants.size === 0) {
+        rooms.delete(roomId);
+        return undefined;
+      }
+
+      return snapshotRoom(room, now);
+    },
+
+    prune(now = Date.now()) {
+      const removedRooms: string[] = [];
+
+      for (const [roomId, room] of rooms) {
+        for (const [sessionId, participant] of room.participants) {
+          if (
+            !participant.connected &&
+            now - participant.lastSeenAt > options.reconnectGraceMs
+          ) {
+            room.participants.delete(sessionId);
+          }
+        }
+
+        promoteHost(room);
+
+        if (
+          room.participants.size === 0 &&
+          now - room.lastActivityAt > options.roomTtlMs
+        ) {
+          rooms.delete(roomId);
+          removedRooms.push(roomId);
+        }
+      }
+
+      return removedRooms;
+    },
+
+    getRoomCount() {
+      return rooms.size;
+    },
+
+    getConnectedParticipantCount() {
+      let count = 0;
+      for (const room of rooms.values()) {
+        count += Array.from(room.participants.values()).filter(
+          (participant) => participant.connected,
+        ).length;
+      }
+      return count;
+    },
+  };
 }
 
-function shouldAcceptPlaybackUpdate(
-  currentPlayback: PlaybackSnapshot | undefined,
-  nextPlayback: PlaybackSnapshot,
-) {
-  if (!currentPlayback) {
-    return true;
-  }
-
-  return (
-    currentPlayback.episodeUrl !== nextPlayback.episodeUrl ||
-    currentPlayback.state !== nextPlayback.state ||
-    Math.abs(currentPlayback.currentTime - nextPlayback.currentTime) > 0.05 ||
-    currentPlayback.playbackRate !== nextPlayback.playbackRate ||
-    currentPlayback.duration !== nextPlayback.duration ||
-    currentPlayback.updatedAt < nextPlayback.updatedAt
-  );
-}
-
-function resolveParticipantDisplayName(
-  nextDisplayName: string | undefined,
-  existingDisplayName: string | undefined,
-  sessionId: string,
-) {
-  const trimmed = nextDisplayName?.trim();
-  if (trimmed) {
-    return trimmed.slice(0, 40);
-  }
-
-  if (existingDisplayName) {
-    return existingDisplayName;
-  }
-
-  return `Guest ${sessionId.slice(0, 4)}`;
-}
+export type { JoinResult, RoomStoreSnapshot } from "./room-state";

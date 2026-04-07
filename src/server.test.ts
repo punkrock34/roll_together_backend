@@ -1,12 +1,16 @@
 import { describe, expect, it } from "vitest";
 
-import { PROTOCOL_VERSION, parseClientMessage } from "./protocol";
-import { RoomStore } from "./room-store";
-import { buildHealthPayload, buildVersionPayload } from "./server";
+import {
+  PROTOCOL_VERSION,
+  parseClientMessage,
+  parseServerMessage,
+} from "./protocol";
+import { buildHealthPayload, buildVersionPayload } from "./http";
+import { createRoomStore } from "./room-store";
 
 describe("backend server", () => {
   it("builds health and version payloads for operational endpoints", () => {
-    const store = new RoomStore({
+    const store = createRoomStore({
       roomTtlMs: 60_000,
       reconnectGraceMs: 30_000,
     });
@@ -18,7 +22,7 @@ describe("backend server", () => {
     expect(version.protocolVersion).toBe(PROTOCOL_VERSION);
   });
 
-  it("parses valid join and navigate websocket messages", () => {
+  it("parses valid join, transfer, and host transfer websocket messages", () => {
     const joinMessage = parseClientMessage(
       JSON.stringify({
         type: "join",
@@ -38,10 +42,23 @@ describe("backend server", () => {
       }),
     );
 
-    const navigateMessage = parseClientMessage(
+    const transferHostMessage = parseClientMessage(
       JSON.stringify({
-        type: "navigate",
+        type: "transfer_host",
         version: PROTOCOL_VERSION,
+        targetSessionId: "viewer-1",
+      }),
+    );
+
+    const hostTransferredMessage = parseServerMessage(
+      JSON.stringify({
+        type: "host_transferred",
+        version: PROTOCOL_VERSION,
+        roomId: "room-1",
+        participantCount: 2,
+        participants: [],
+        hostSessionId: "viewer-1",
+        previousHostSessionId: "host-1",
         playback: {
           provider: "crunchyroll",
           episodeTitle: "Episode 2",
@@ -59,6 +76,7 @@ describe("backend server", () => {
     expect(
       joinMessage && "roomId" in joinMessage ? joinMessage.roomId : undefined,
     ).toBe("room-1");
-    expect(navigateMessage?.type).toBe("navigate");
+    expect(transferHostMessage?.type).toBe("transfer_host");
+    expect(hostTransferredMessage?.type).toBe("host_transferred");
   });
 });
