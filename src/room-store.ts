@@ -1,32 +1,26 @@
-import type { PlaybackSnapshot, RoomMutationErrorCode } from "./protocol";
+import type { PlaybackSnapshot } from "./protocol";
 import {
   createId,
   createRoomRecord,
-  promoteHost,
   resolveParticipantDisplayName,
-  resolvePlayback,
-  shouldAcceptPlaybackUpdate,
   snapshotRoom,
   type JoinResult,
   type RoomStoreSnapshot,
 } from "./room-state";
+
+type MutationErrorCode = "unknown_room" | "not_joined" | "episode_mismatch";
 
 interface MutationSuccess {
   ok: true;
   snapshot: RoomStoreSnapshot;
 }
 
-interface TransferHostSuccess extends MutationSuccess {
-  previousHostSessionId: string;
-}
-
 interface MutationFailure {
   ok: false;
-  code: RoomMutationErrorCode;
+  code: MutationErrorCode;
 }
 
 export type RoomMutationResult = MutationSuccess | MutationFailure;
-export type TransferHostResult = TransferHostSuccess | MutationFailure;
 
 export interface RoomStoreOptions {
   roomTtlMs: number;
@@ -43,24 +37,24 @@ interface JoinInput {
 
 export interface RoomStore {
   join(input: JoinInput): JoinResult;
-  sync(
+  play(
     roomId: string,
     sessionId: string,
     playback: PlaybackSnapshot,
     now?: number,
   ): RoomMutationResult;
-  navigate(
+  pause(
     roomId: string,
     sessionId: string,
     playback: PlaybackSnapshot,
     now?: number,
   ): RoomMutationResult;
-  transferHost(
+  seek(
     roomId: string,
     sessionId: string,
-    targetSessionId: string,
+    playback: PlaybackSnapshot,
     now?: number,
-  ): TransferHostResult;
+  ): RoomMutationResult;
   getSnapshot(roomId: string, now?: number): RoomStoreSnapshot | undefined;
   markDisconnected(
     roomId: string,
@@ -85,15 +79,15 @@ export function createRoomStore(options: RoomStoreOptions): RoomStore {
     if (!room) {
       return undefined;
     }
-
     return snapshotRoom(room, now);
   };
 
-  const applyHostPlayback = (
+  const applyPlaybackMutation = (
     roomId: string,
     sessionId: string,
     playback: PlaybackSnapshot,
     now: number,
+    nextState?: "playing" | "paused",
   ): RoomMutationResult => {
     const room = rooms.get(roomId);
     if (!room) {
@@ -105,17 +99,20 @@ export function createRoomStore(options: RoomStoreOptions): RoomStore {
       return { ok: false, code: "not_joined" };
     }
 
-    if (room.hostSessionId !== sessionId) {
-      participant.connected = true;
-      participant.lastSeenAt = now;
-      room.lastActivityAt = now;
-      return { ok: false, code: "not_host" };
-    }
-
     participant.connected = true;
     participant.lastSeenAt = now;
     room.lastActivityAt = now;
-    room.playback = { ...playback, updatedAt: now };
+
+    if (room.playback.episodeId !== playback.episodeId) {
+      return { ok: false, code: "episode_mismatch" };
+    }
+
+    room.playback = {
+      ...playback,
+      state: nextState ?? playback.state,
+      updatedAt: now,
+    };
+    room.revision += 1;
 
     return {
       ok: true,
@@ -131,11 +128,9 @@ export function createRoomStore(options: RoomStoreOptions): RoomStore {
       const createdRoom = !existingRoom;
       const room =
         existingRoom ?? createRoomRecord(roomId, input.playback, now);
-      const previousPlayback = createdRoom
-        ? undefined
-        : resolvePlayback(room, now);
 
       if (!existingRoom) {
+        room.revision = 1;
         rooms.set(roomId, room);
       }
 
@@ -158,88 +153,29 @@ export function createRoomStore(options: RoomStoreOptions): RoomStore {
         lastSeenAt: now,
         connected: true,
       });
-
       room.lastActivityAt = now;
-      if (!room.hostSessionId) {
-        room.hostSessionId = sessionId;
-      }
-
-      const isHost = room.hostSessionId === sessionId;
-      let episodeChanged = false;
 
       if (createdRoom) {
         room.playback = { ...input.playback, updatedAt: now };
-      } else if (
-        isHost &&
-        shouldAcceptPlaybackUpdate(previousPlayback, input.playback)
-      ) {
-        episodeChanged =
-          previousPlayback?.episodeUrl !== input.playback.episodeUrl;
-        room.playback = { ...input.playback, updatedAt: now };
       }
-
-      promoteHost(room);
 
       return {
         sessionId,
         createdRoom,
-        episodeChanged,
         ...snapshotRoom(room, now),
       };
     },
 
-    sync(roomId, sessionId, playback, now = Date.now()) {
-      return applyHostPlayback(roomId, sessionId, playback, now);
+    play(roomId, sessionId, playback, now = Date.now()) {
+      return applyPlaybackMutation(roomId, sessionId, playback, now, "playing");
     },
 
-    navigate(roomId, sessionId, playback, now = Date.now()) {
-      return applyHostPlayback(roomId, sessionId, playback, now);
+    pause(roomId, sessionId, playback, now = Date.now()) {
+      return applyPlaybackMutation(roomId, sessionId, playback, now, "paused");
     },
 
-    transferHost(roomId, sessionId, targetSessionId, now = Date.now()) {
-      const room = rooms.get(roomId);
-      if (!room) {
-        return { ok: false, code: "unknown_room" };
-      }
-
-      const currentHost = room.participants.get(sessionId);
-      if (!currentHost) {
-        return { ok: false, code: "not_joined" };
-      }
-
-      currentHost.connected = true;
-      currentHost.lastSeenAt = now;
-      room.lastActivityAt = now;
-
-      if (room.hostSessionId !== sessionId) {
-        return { ok: false, code: "not_host" };
-      }
-
-      if (sessionId === targetSessionId) {
-        return { ok: false, code: "invalid_transfer_target" };
-      }
-
-      const target = room.participants.get(targetSessionId);
-      if (
-        !target ||
-        !target.connected ||
-        room.hostSessionId === targetSessionId
-      ) {
-        return { ok: false, code: "invalid_transfer_target" };
-      }
-
-      target.lastSeenAt = now;
-      room.lastActivityAt = now;
-      room.playback = resolvePlayback(room, now);
-
-      const previousHostSessionId = room.hostSessionId;
-      room.hostSessionId = targetSessionId;
-
-      return {
-        ok: true,
-        previousHostSessionId,
-        snapshot: snapshotRoom(room, now),
-      };
+    seek(roomId, sessionId, playback, now = Date.now()) {
+      return applyPlaybackMutation(roomId, sessionId, playback, now);
     },
 
     getSnapshot,
@@ -254,10 +190,8 @@ export function createRoomStore(options: RoomStoreOptions): RoomStore {
       if (participant) {
         participant.connected = false;
         participant.lastSeenAt = now;
-        room.lastActivityAt = now;
       }
-
-      promoteHost(room);
+      room.lastActivityAt = now;
       return snapshotRoom(room, now);
     },
 
@@ -269,7 +203,6 @@ export function createRoomStore(options: RoomStoreOptions): RoomStore {
 
       room.participants.delete(sessionId);
       room.lastActivityAt = now;
-      promoteHost(room);
 
       if (room.participants.size === 0) {
         rooms.delete(roomId);
@@ -291,8 +224,6 @@ export function createRoomStore(options: RoomStoreOptions): RoomStore {
             room.participants.delete(sessionId);
           }
         }
-
-        promoteHost(room);
 
         if (
           room.participants.size === 0 &&

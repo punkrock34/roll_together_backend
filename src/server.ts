@@ -1,6 +1,7 @@
 import { createServer as createHttpServer } from "node:http";
 
 import { getConfig, type AppConfig } from "./config";
+import { createSyncDebugLogger } from "./debug-log";
 import { createHttpApp } from "./http";
 import { createRoomStore } from "./room-store";
 import { createRoomWebSocketServer } from "./websocket";
@@ -13,7 +14,12 @@ export function createRollTogetherServer(config: AppConfig = getConfig()) {
   const startedAt = Date.now();
   const app = createHttpApp({ config, store, startedAt });
   const httpServer = createHttpServer(app);
-  const { wsServer } = createRoomWebSocketServer({ httpServer, store });
+  const debugLogger = createSyncDebugLogger(config.syncDebugLogPath);
+  const { io } = createRoomWebSocketServer({
+    httpServer,
+    store,
+    debugLogger,
+  });
 
   const pruneInterval = setInterval(() => {
     store.prune();
@@ -23,7 +29,7 @@ export function createRollTogetherServer(config: AppConfig = getConfig()) {
     app,
     store,
     httpServer,
-    wsServer,
+    io,
     async start() {
       await new Promise<void>((resolve) => {
         httpServer.listen(config.port, config.host, () => resolve());
@@ -32,9 +38,8 @@ export function createRollTogetherServer(config: AppConfig = getConfig()) {
     async stop() {
       clearInterval(pruneInterval);
 
-      for (const client of wsServer.clients) {
-        client.close();
-      }
+      io.disconnectSockets(true);
+      io.close();
 
       await new Promise<void>((resolve, reject) => {
         httpServer.close((error) => {

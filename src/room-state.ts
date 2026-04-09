@@ -12,7 +12,7 @@ export interface ParticipantRecord {
 
 export interface RoomRecord {
   roomId: string;
-  hostSessionId: string;
+  revision: number;
   playback: PlaybackSnapshot;
   participants: Map<string, ParticipantRecord>;
   lastActivityAt: number;
@@ -20,16 +20,16 @@ export interface RoomRecord {
 
 export interface RoomStoreSnapshot {
   roomId: string;
+  revision: number;
+  updatedAt: number;
   playback: PlaybackSnapshot;
   participants: ParticipantPresence[];
   participantCount: number;
-  hostSessionId: string;
 }
 
 export interface JoinResult extends RoomStoreSnapshot {
   sessionId: string;
   createdRoom: boolean;
-  episodeChanged: boolean;
 }
 
 export function createRoomRecord(
@@ -39,7 +39,7 @@ export function createRoomRecord(
 ) {
   return {
     roomId,
-    hostSessionId: "",
+    revision: 0,
     playback: { ...playback, updatedAt: now },
     participants: new Map<string, ParticipantRecord>(),
     lastActivityAt: now,
@@ -48,11 +48,10 @@ export function createRoomRecord(
 
 export function snapshotRoom(room: RoomRecord, now: number): RoomStoreSnapshot {
   const participants = Array.from(room.participants.values())
-    .filter((participant) => participant.connected)
     .map<ParticipantPresence>((participant) => ({
       sessionId: participant.sessionId,
       displayName: participant.displayName,
-      isHost: participant.sessionId === room.hostSessionId,
+      isHost: false,
       joinedAt: participant.joinedAt,
       lastSeenAt: participant.lastSeenAt,
       connected: participant.connected,
@@ -61,10 +60,11 @@ export function snapshotRoom(room: RoomRecord, now: number): RoomStoreSnapshot {
 
   return {
     roomId: room.roomId,
+    revision: room.revision,
+    updatedAt: room.lastActivityAt,
     playback: resolvePlayback(room, now),
     participants,
     participantCount: participants.length,
-    hostSessionId: room.hostSessionId,
   };
 }
 
@@ -86,37 +86,6 @@ export function resolvePlayback(
     currentTime,
     updatedAt: now,
   };
-}
-
-export function promoteHost(room: RoomRecord) {
-  const currentHost = room.participants.get(room.hostSessionId);
-  if (currentHost?.connected) {
-    return;
-  }
-
-  const nextHost = Array.from(room.participants.values())
-    .filter((participant) => participant.connected)
-    .sort((left, right) => left.joinedAt - right.joinedAt)[0];
-
-  room.hostSessionId = nextHost?.sessionId ?? "";
-}
-
-export function shouldAcceptPlaybackUpdate(
-  currentPlayback: PlaybackSnapshot | undefined,
-  nextPlayback: PlaybackSnapshot,
-) {
-  if (!currentPlayback) {
-    return true;
-  }
-
-  return (
-    currentPlayback.episodeUrl !== nextPlayback.episodeUrl ||
-    currentPlayback.state !== nextPlayback.state ||
-    Math.abs(currentPlayback.currentTime - nextPlayback.currentTime) > 0.05 ||
-    currentPlayback.playbackRate !== nextPlayback.playbackRate ||
-    currentPlayback.duration !== nextPlayback.duration ||
-    currentPlayback.updatedAt < nextPlayback.updatedAt
-  );
 }
 
 export function resolveParticipantDisplayName(
