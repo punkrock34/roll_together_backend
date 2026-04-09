@@ -27,7 +27,7 @@ export function getConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     reconnectGraceMs: parseNumber(env.RECONNECT_GRACE_MS, 60 * 1000),
     corsOrigin: env.CORS_ORIGIN ?? "*",
     syncDebugLogPath: debugLoggingEnabled
-      ? env.SYNC_DEBUG_LOG_PATH ?? "/tmp/roll-together-sync.log"
+      ? (env.SYNC_DEBUG_LOG_PATH ?? "/tmp/roll-together-sync.log")
       : undefined,
   };
 }

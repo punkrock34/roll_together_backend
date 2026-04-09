@@ -1,18 +1,23 @@
-export const PROTOCOL_VERSION = 4;
+export const PROTOCOL_VERSION = 5;
 
 export type ProviderName = "crunchyroll";
 export type PlaybackState = "playing" | "paused";
+export type RoomControlMode = "host_only" | "shared_playback";
 export type ClientEventName =
   | "join_room"
   | "leave_room"
   | "play"
   | "pause"
   | "seek"
+  | "navigate_episode"
+  | "set_room_control_mode"
+  | "transfer_host"
   | "request_state"
   | "heartbeat";
 export type ServerEventName =
   | "room_joined"
   | "state_snapshot"
+  | "room_navigation"
   | "presence_update"
   | "command_error"
   | "heartbeat_ack";
@@ -21,7 +26,19 @@ export type CommandErrorCode =
   | "invalid_payload"
   | "unknown_room"
   | "not_joined"
-  | "episode_mismatch";
+  | "episode_mismatch"
+  | "forbidden_playback_control"
+  | "forbidden_navigation_control"
+  | "forbidden_host_transfer"
+  | "forbidden_control_mode_change"
+  | "unknown_participant";
+
+export interface RoomCapabilities {
+  canControlPlayback: boolean;
+  canNavigate: boolean;
+  canTransferHost: boolean;
+  canChangeMode: boolean;
+}
 
 export interface EpisodeInfo {
   provider: ProviderName;
@@ -51,6 +68,9 @@ export interface RoomStateSnapshot {
   roomId: string;
   revision: number;
   updatedAt: number;
+  hostSessionId: string;
+  controlMode: RoomControlMode;
+  navigationRevision: number;
   playback: PlaybackSnapshot;
   participants: ParticipantPresence[];
   participantCount: number;
@@ -73,6 +93,21 @@ export interface PlaybackCommandPayload {
   playback: PlaybackSnapshot;
 }
 
+export interface NavigateEpisodePayload {
+  version: number;
+  playback: PlaybackSnapshot;
+}
+
+export interface SetRoomControlModePayload {
+  version: number;
+  controlMode: RoomControlMode;
+}
+
+export interface TransferHostPayload {
+  version: number;
+  targetSessionId: string;
+}
+
 export interface RequestStatePayload {
   version: number;
 }
@@ -92,6 +127,16 @@ export interface RoomJoinedPayload {
 export interface StateSnapshotPayload {
   version: number;
   state: RoomStateSnapshot;
+}
+
+export interface RoomNavigationPayload {
+  version: number;
+  roomId: string;
+  revision: number;
+  navigationRevision: number;
+  initiatedBySessionId: string;
+  playback: PlaybackSnapshot;
+  updatedAt: number;
 }
 
 export interface PresenceUpdatePayload {
@@ -137,6 +182,10 @@ function isCurrentProtocolVersion(value: unknown) {
 
 function isPlaybackState(value: unknown): value is PlaybackState {
   return value === "playing" || value === "paused";
+}
+
+function isRoomControlMode(value: unknown): value is RoomControlMode {
+  return value === "host_only" || value === "shared_playback";
 }
 
 function isParticipantPresence(value: unknown): value is ParticipantPresence {
@@ -188,6 +237,10 @@ export function isRoomStateSnapshot(
     isFiniteNumber(revision) &&
     revision >= 0 &&
     isFiniteNumber(value.updatedAt) &&
+    isNonEmptyString(value.hostSessionId) &&
+    isRoomControlMode(value.controlMode) &&
+    isFiniteNumber(value.navigationRevision) &&
+    value.navigationRevision >= 0 &&
     isPlaybackSnapshot(value.playback) &&
     Array.isArray(value.participants) &&
     value.participants.every((participant) =>
@@ -232,6 +285,48 @@ export function parsePlaybackCommandPayload(
     return null;
   }
   return value as unknown as PlaybackCommandPayload;
+}
+
+export function parseNavigateEpisodePayload(
+  value: unknown,
+): NavigateEpisodePayload | null {
+  if (
+    !isRecord(value) ||
+    !isCurrentProtocolVersion(value.version) ||
+    !isPlaybackSnapshot(value.playback)
+  ) {
+    return null;
+  }
+
+  return value as unknown as NavigateEpisodePayload;
+}
+
+export function parseSetRoomControlModePayload(
+  value: unknown,
+): SetRoomControlModePayload | null {
+  if (
+    !isRecord(value) ||
+    !isCurrentProtocolVersion(value.version) ||
+    !isRoomControlMode(value.controlMode)
+  ) {
+    return null;
+  }
+
+  return value as unknown as SetRoomControlModePayload;
+}
+
+export function parseTransferHostPayload(
+  value: unknown,
+): TransferHostPayload | null {
+  if (
+    !isRecord(value) ||
+    !isCurrentProtocolVersion(value.version) ||
+    !isNonEmptyString(value.targetSessionId)
+  ) {
+    return null;
+  }
+
+  return value as unknown as TransferHostPayload;
 }
 
 export function parseRequestStatePayload(
@@ -282,6 +377,25 @@ export function parseStateSnapshotPayload(
   return value as unknown as StateSnapshotPayload;
 }
 
+export function parseRoomNavigationPayload(
+  value: unknown,
+): RoomNavigationPayload | null {
+  if (
+    !isRecord(value) ||
+    !isCurrentProtocolVersion(value.version) ||
+    !isNonEmptyString(value.roomId) ||
+    !isFiniteNumber(value.revision) ||
+    !isFiniteNumber(value.navigationRevision) ||
+    !isNonEmptyString(value.initiatedBySessionId) ||
+    !isPlaybackSnapshot(value.playback) ||
+    !isFiniteNumber(value.updatedAt)
+  ) {
+    return null;
+  }
+
+  return value as unknown as RoomNavigationPayload;
+}
+
 export function parsePresenceUpdatePayload(
   value: unknown,
 ): PresenceUpdatePayload | null {
@@ -320,6 +434,11 @@ export function parseCommandErrorPayload(
     "unknown_room",
     "not_joined",
     "episode_mismatch",
+    "forbidden_playback_control",
+    "forbidden_navigation_control",
+    "forbidden_host_transfer",
+    "forbidden_control_mode_change",
+    "unknown_participant",
   ] satisfies CommandErrorCode[];
 
   if (!knownCode.includes(value.code as CommandErrorCode)) {
@@ -341,4 +460,19 @@ export function parseHeartbeatAckPayload(
     return null;
   }
   return value as unknown as HeartbeatAckPayload;
+}
+
+export function resolveRoomCapabilities(input: {
+  controlMode: RoomControlMode;
+  hostSessionId: string;
+  sessionId: string;
+}): RoomCapabilities {
+  const isHost = input.sessionId === input.hostSessionId;
+
+  return {
+    canControlPlayback: input.controlMode === "shared_playback" || isHost,
+    canNavigate: isHost,
+    canTransferHost: isHost,
+    canChangeMode: isHost,
+  };
 }

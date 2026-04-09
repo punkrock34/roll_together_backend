@@ -4,6 +4,7 @@ import {
   PROTOCOL_VERSION,
   parseHeartbeatPayload,
   parseJoinRoomPayload,
+  parseRoomNavigationPayload,
   parsePlaybackCommandPayload,
   parseRequestStatePayload,
   parseStateSnapshotPayload,
@@ -83,6 +84,9 @@ describe("backend protocol payload validators", () => {
       roomId: "room-1",
       revision: 3,
       updatedAt: 400,
+      hostSessionId: "session-1",
+      controlMode: "host_only",
+      navigationRevision: 0,
       playback: {
         ...playback,
         state: "playing",
@@ -108,5 +112,24 @@ describe("backend protocol payload validators", () => {
 
     expect(parsed?.state.revision).toBe(3);
     expect(parsed?.state.playback.episodeId).toBe("G4VUQ1ZKW");
+  });
+
+  it("parses room_navigation payloads", () => {
+    const parsed = parseRoomNavigationPayload({
+      version: PROTOCOL_VERSION,
+      roomId: "room-1",
+      revision: 4,
+      navigationRevision: 1,
+      initiatedBySessionId: "session-1",
+      updatedAt: 500,
+      playback: {
+        ...playback,
+        episodeId: "G123NEWEP",
+        episodeUrl: "https://www.crunchyroll.com/watch/G123NEWEP/example",
+      },
+    });
+
+    expect(parsed?.navigationRevision).toBe(1);
+    expect(parsed?.playback.episodeId).toBe("G123NEWEP");
   });
 });

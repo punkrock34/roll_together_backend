@@ -215,4 +215,108 @@ describe("backend server", () => {
       await server.stop();
     }
   });
+
+  it("enforces host-only navigation and emits room_navigation for accepted commands", async () => {
+    const server = createRollTogetherServer({
+      host: "127.0.0.1",
+      port: 0,
+      corsOrigin: "*",
+      roomTtlMs: 60_000,
+      reconnectGraceMs: 30_000,
+    });
+    await server.start();
+
+    try {
+      const port = (server.httpServer.address() as AddressInfo).port;
+      const baseUrl = `http://127.0.0.1:${port}`;
+
+      const host = createClient(baseUrl, {
+        path: "/ws",
+        transports: ["websocket"],
+      });
+      const follower = createClient(baseUrl, {
+        path: "/ws",
+        transports: ["websocket"],
+      });
+      openSockets.push(host, follower);
+
+      await Promise.all([
+        waitForEvent(host, "connect"),
+        waitForEvent(follower, "connect"),
+      ]);
+
+      const hostJoined = waitForEvent<{
+        roomId: string;
+        sessionId: string;
+      }>(host, "room_joined");
+      host.emit("join_room", {
+        version: PROTOCOL_VERSION,
+        playback,
+      });
+      const hostJoinedPayload = await hostJoined;
+
+      const followerJoined = waitForEvent(follower, "room_joined");
+      follower.emit("join_room", {
+        version: PROTOCOL_VERSION,
+        roomId: hostJoinedPayload.roomId,
+        playback,
+      });
+      await followerJoined;
+
+      const deniedNavigation = waitForEvent<{ code: string }>(
+        follower,
+        "command_error",
+      );
+      follower.emit("navigate_episode", {
+        version: PROTOCOL_VERSION,
+        playback: {
+          ...playback,
+          episodeId: "G123NEWEP",
+          episodeUrl: "https://www.crunchyroll.com/watch/G123NEWEP/example",
+          episodeTitle: "Episode 2",
+          currentTime: 0,
+          updatedAt: Date.now(),
+        },
+      });
+      expect((await deniedNavigation).code).toBe(
+        "forbidden_navigation_control",
+      );
+
+      const roomNavigation = waitForEvent<{
+        playback: { episodeId: string };
+        navigationRevision: number;
+      }>(
+        follower,
+        "room_navigation",
+        (payload) => payload.playback.episodeId === "G123NEWEP",
+      );
+      const stateAfterNavigation = waitForEvent<{
+        state: { playback: { episodeId: string } };
+      }>(
+        host,
+        "state_snapshot",
+        (payload) => payload.state.playback.episodeId === "G123NEWEP",
+      );
+
+      host.emit("navigate_episode", {
+        version: PROTOCOL_VERSION,
+        playback: {
+          ...playback,
+          episodeId: "G123NEWEP",
+          episodeUrl: "https://www.crunchyroll.com/watch/G123NEWEP/example",
+          episodeTitle: "Episode 2",
+          currentTime: 0,
+          updatedAt: Date.now(),
+        },
+      });
+
+      const [navigationPayload] = await Promise.all([
+        roomNavigation,
+        stateAfterNavigation,
+      ]);
+      expect(navigationPayload.navigationRevision).toBe(1);
+    } finally {
+      await server.stop();
+    }
+  });
 });

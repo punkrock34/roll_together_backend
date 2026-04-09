@@ -1,6 +1,10 @@
 import { randomBytes } from "node:crypto";
 
-import type { ParticipantPresence, PlaybackSnapshot } from "./protocol";
+import type {
+  ParticipantPresence,
+  PlaybackSnapshot,
+  RoomControlMode,
+} from "./protocol";
 
 export interface ParticipantRecord {
   sessionId: string;
@@ -13,6 +17,9 @@ export interface ParticipantRecord {
 export interface RoomRecord {
   roomId: string;
   revision: number;
+  hostSessionId: string;
+  controlMode: RoomControlMode;
+  navigationRevision: number;
   playback: PlaybackSnapshot;
   participants: Map<string, ParticipantRecord>;
   lastActivityAt: number;
@@ -22,6 +29,9 @@ export interface RoomStoreSnapshot {
   roomId: string;
   revision: number;
   updatedAt: number;
+  hostSessionId: string;
+  controlMode: RoomControlMode;
+  navigationRevision: number;
   playback: PlaybackSnapshot;
   participants: ParticipantPresence[];
   participantCount: number;
@@ -36,14 +46,17 @@ export function createRoomRecord(
   roomId: string,
   playback: PlaybackSnapshot,
   now: number,
-) {
+): RoomRecord {
   return {
     roomId,
     revision: 0,
+    hostSessionId: "",
+    controlMode: "shared_playback",
+    navigationRevision: 0,
     playback: { ...playback, updatedAt: now },
     participants: new Map<string, ParticipantRecord>(),
     lastActivityAt: now,
-  } satisfies RoomRecord;
+  };
 }
 
 export function snapshotRoom(room: RoomRecord, now: number): RoomStoreSnapshot {
@@ -51,7 +64,7 @@ export function snapshotRoom(room: RoomRecord, now: number): RoomStoreSnapshot {
     .map<ParticipantPresence>((participant) => ({
       sessionId: participant.sessionId,
       displayName: participant.displayName,
-      isHost: false,
+      isHost: participant.sessionId === room.hostSessionId,
       joinedAt: participant.joinedAt,
       lastSeenAt: participant.lastSeenAt,
       connected: participant.connected,
@@ -62,6 +75,9 @@ export function snapshotRoom(room: RoomRecord, now: number): RoomStoreSnapshot {
     roomId: room.roomId,
     revision: room.revision,
     updatedAt: room.lastActivityAt,
+    hostSessionId: room.hostSessionId,
+    controlMode: room.controlMode,
+    navigationRevision: room.navigationRevision,
     playback: resolvePlayback(room, now),
     participants,
     participantCount: participants.length,

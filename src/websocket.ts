@@ -7,13 +7,17 @@ import {
   parseHeartbeatPayload,
   parseJoinRoomPayload,
   parseLeaveRoomPayload,
+  parseNavigateEpisodePayload,
   parsePlaybackCommandPayload,
   parseRequestStatePayload,
+  parseSetRoomControlModePayload,
+  parseTransferHostPayload,
   type CommandErrorCode,
   type CommandErrorPayload,
   type HeartbeatAckPayload,
   type PresenceUpdatePayload,
   type RoomJoinedPayload,
+  type RoomNavigationPayload,
   type StateSnapshotPayload,
 } from "./protocol";
 import type { RoomStore, RoomStoreSnapshot } from "./room-store";
@@ -28,6 +32,31 @@ interface RoomWebSocketServerOptions {
   httpServer: HttpServer;
   store: RoomStore;
   debugLogger?: SyncDebugLogger;
+}
+
+function mutationErrorMessage(code: CommandErrorCode) {
+  switch (code) {
+    case "unknown_room":
+      return "The room no longer exists.";
+    case "not_joined":
+      return "Join a room before sending commands.";
+    case "episode_mismatch":
+      return "The command episode does not match the room episode.";
+    case "forbidden_playback_control":
+      return "You are not allowed to control playback in this room mode.";
+    case "forbidden_navigation_control":
+      return "You are not allowed to change episodes in this room mode.";
+    case "forbidden_host_transfer":
+      return "Only the host can transfer host ownership.";
+    case "forbidden_control_mode_change":
+      return "Only the host can change room control mode.";
+    case "unknown_participant":
+      return "The selected participant is unavailable for this action.";
+    case "invalid_message":
+      return "Invalid socket message.";
+    case "invalid_payload":
+      return "Invalid command payload.";
+  }
 }
 
 export function createRoomWebSocketServer({
@@ -51,7 +80,7 @@ export function createRoomWebSocketServer({
   const sendCommandError = (
     socket: Socket,
     code: CommandErrorCode,
-    message: string,
+    message = mutationErrorMessage(code),
   ) => {
     const payload: CommandErrorPayload = {
       version: PROTOCOL_VERSION,
@@ -59,24 +88,11 @@ export function createRoomWebSocketServer({
       message,
     };
     socket.emit("command_error", payload);
-    logSync("command_error", {
+    logSync("command_rejected", {
       socketId: socket.id,
       code,
       message,
     });
-  };
-
-  const messageForMutationError = (
-    code: "unknown_room" | "not_joined" | "episode_mismatch",
-  ) => {
-    switch (code) {
-      case "unknown_room":
-        return "The room no longer exists.";
-      case "not_joined":
-        return "Join a room before sending playback commands.";
-      case "episode_mismatch":
-        return "The command episode does not match the room episode.";
-    }
   };
 
   const emitPresence = (roomId: string, snapshot?: RoomStoreSnapshot) => {
@@ -94,11 +110,6 @@ export function createRoomWebSocketServer({
       updatedAt: source.updatedAt,
     };
     io.to(roomId).emit("presence_update", payload);
-    logSync("presence_update_emit", {
-      roomId,
-      revision: source.revision,
-      participantCount: source.participantCount,
-    });
   };
 
   const emitStateSnapshot = (roomId: string, snapshot: RoomStoreSnapshot) => {
@@ -107,15 +118,32 @@ export function createRoomWebSocketServer({
       state: snapshot,
     };
     io.to(roomId).emit("state_snapshot", payload);
-    logSync("state_snapshot_emit", {
-      roomId,
+  };
+
+  const emitRoomNavigation = (
+    roomId: string,
+    snapshot: RoomStoreSnapshot,
+    initiatedBySessionId: string,
+  ) => {
+    const payload: RoomNavigationPayload = {
+      version: PROTOCOL_VERSION,
+      roomId: snapshot.roomId,
       revision: snapshot.revision,
-      episodeId: snapshot.playback.episodeId,
-      state: snapshot.playback.state,
-      currentTime: snapshot.playback.currentTime,
-      updatedAt: snapshot.playback.updatedAt,
-      participantCount: snapshot.participantCount,
-    });
+      navigationRevision: snapshot.navigationRevision,
+      initiatedBySessionId,
+      playback: snapshot.playback,
+      updatedAt: snapshot.updatedAt,
+    };
+    io.to(roomId).emit("room_navigation", payload);
+  };
+
+  const getSocketContext = (socket: Socket): SocketContext | null => {
+    const context = socketContexts.get(socket.id);
+    if (!context?.roomId || !context.sessionId) {
+      sendCommandError(socket, "not_joined");
+      return null;
+    }
+    return context;
   };
 
   const applyPlaybackCommand = (
@@ -123,11 +151,6 @@ export function createRoomWebSocketServer({
     event: "play" | "pause" | "seek",
     payload: unknown,
   ) => {
-    logSync("playback_command_received", {
-      socketId: socket.id,
-      event,
-    });
-
     const parsed = parsePlaybackCommandPayload(payload);
     if (!parsed) {
       sendCommandError(
@@ -138,13 +161,8 @@ export function createRoomWebSocketServer({
       return;
     }
 
-    const context = socketContexts.get(socket.id);
+    const context = getSocketContext(socket);
     if (!context?.roomId || !context.sessionId) {
-      sendCommandError(
-        socket,
-        "not_joined",
-        "Join a room before sending playback commands.",
-      );
       return;
     }
 
@@ -156,23 +174,18 @@ export function createRoomWebSocketServer({
           : store.seek(context.roomId, context.sessionId, parsed.playback);
 
     if (!result.ok) {
-      sendCommandError(
-        socket,
-        result.code,
-        messageForMutationError(result.code),
-      );
+      sendCommandError(socket, result.code);
       return;
     }
 
     logSync("playback_command_applied", {
-      socketId: socket.id,
       roomId: context.roomId,
       sessionId: context.sessionId,
-      event,
+      command: event,
       revision: result.snapshot.revision,
+      episodeId: result.snapshot.playback.episodeId,
       state: result.snapshot.playback.state,
       currentTime: result.snapshot.playback.currentTime,
-      updatedAt: result.snapshot.playback.updatedAt,
     });
 
     emitStateSnapshot(context.roomId, result.snapshot);
@@ -180,10 +193,8 @@ export function createRoomWebSocketServer({
 
   io.on("connection", (socket) => {
     socketContexts.set(socket.id, {});
-    logSync("socket_connected", { socketId: socket.id });
 
     socket.on("join_room", (payload: unknown) => {
-      logSync("join_room_received", { socketId: socket.id });
       const parsed = parseJoinRoomPayload(payload);
       if (!parsed) {
         sendCommandError(
@@ -211,30 +222,15 @@ export function createRoomWebSocketServer({
         version: PROTOCOL_VERSION,
         roomId: joined.roomId,
         sessionId: joined.sessionId,
-        state: {
-          roomId: joined.roomId,
-          revision: joined.revision,
-          updatedAt: joined.updatedAt,
-          playback: joined.playback,
-          participants: joined.participants,
-          participantCount: joined.participantCount,
-        },
+        state: joined,
       };
 
       socket.emit("room_joined", joinedPayload);
-      logSync("room_joined_emit", {
-        socketId: socket.id,
-        roomId: joined.roomId,
-        sessionId: joined.sessionId,
-        revision: joined.revision,
-        participantCount: joined.participantCount,
-      });
       emitStateSnapshot(joined.roomId, joined);
       emitPresence(joined.roomId, joined);
     });
 
     socket.on("leave_room", (payload: unknown) => {
-      logSync("leave_room_received", { socketId: socket.id });
       const parsed = parseLeaveRoomPayload(payload);
       if (!parsed) {
         sendCommandError(
@@ -257,6 +253,7 @@ export function createRoomWebSocketServer({
       socketContexts.set(socket.id, {});
 
       if (nextSnapshot) {
+        emitStateSnapshot(context.roomId, nextSnapshot);
         emitPresence(context.roomId, nextSnapshot);
       }
 
@@ -275,8 +272,118 @@ export function createRoomWebSocketServer({
       applyPlaybackCommand(socket, "seek", payload);
     });
 
+    socket.on("navigate_episode", (payload: unknown) => {
+      const parsed = parseNavigateEpisodePayload(payload);
+      if (!parsed) {
+        sendCommandError(
+          socket,
+          "invalid_payload",
+          "Invalid navigate_episode payload.",
+        );
+        return;
+      }
+
+      const context = getSocketContext(socket);
+      if (!context?.roomId || !context.sessionId) {
+        return;
+      }
+
+      const result = store.navigateEpisode(
+        context.roomId,
+        context.sessionId,
+        parsed.playback,
+      );
+      if (!result.ok) {
+        sendCommandError(socket, result.code);
+        return;
+      }
+
+      logSync("room_navigation_applied", {
+        roomId: context.roomId,
+        sessionId: context.sessionId,
+        revision: result.snapshot.revision,
+        navigationRevision: result.snapshot.navigationRevision,
+        episodeId: result.snapshot.playback.episodeId,
+      });
+
+      emitRoomNavigation(context.roomId, result.snapshot, context.sessionId);
+      emitStateSnapshot(context.roomId, result.snapshot);
+    });
+
+    socket.on("set_room_control_mode", (payload: unknown) => {
+      const parsed = parseSetRoomControlModePayload(payload);
+      if (!parsed) {
+        sendCommandError(
+          socket,
+          "invalid_payload",
+          "Invalid set_room_control_mode payload.",
+        );
+        return;
+      }
+
+      const context = getSocketContext(socket);
+      if (!context?.roomId || !context.sessionId) {
+        return;
+      }
+
+      const result = store.setRoomControlMode(
+        context.roomId,
+        context.sessionId,
+        parsed.controlMode,
+      );
+      if (!result.ok) {
+        sendCommandError(socket, result.code);
+        return;
+      }
+
+      logSync("room_control_mode_changed", {
+        roomId: context.roomId,
+        sessionId: context.sessionId,
+        revision: result.snapshot.revision,
+        controlMode: result.snapshot.controlMode,
+      });
+
+      emitStateSnapshot(context.roomId, result.snapshot);
+    });
+
+    socket.on("transfer_host", (payload: unknown) => {
+      const parsed = parseTransferHostPayload(payload);
+      if (!parsed) {
+        sendCommandError(
+          socket,
+          "invalid_payload",
+          "Invalid transfer_host payload.",
+        );
+        return;
+      }
+
+      const context = getSocketContext(socket);
+      if (!context?.roomId || !context.sessionId) {
+        return;
+      }
+
+      const result = store.transferHost(
+        context.roomId,
+        context.sessionId,
+        parsed.targetSessionId,
+      );
+      if (!result.ok) {
+        sendCommandError(socket, result.code);
+        return;
+      }
+
+      logSync("host_transferred", {
+        roomId: context.roomId,
+        fromSessionId: context.sessionId,
+        toSessionId: result.snapshot.hostSessionId,
+        revision: result.snapshot.revision,
+      });
+
+      emitStateSnapshot(context.roomId, result.snapshot);
+      emitPresence(context.roomId, result.snapshot);
+    });
+
     socket.on("request_state", (payload: unknown) => {
-      logSync("request_state_received", { socketId: socket.id });
       const parsed = parseRequestStatePayload(payload);
       if (!parsed) {
         sendCommandError(
@@ -287,19 +394,14 @@ export function createRoomWebSocketServer({
         return;
       }
 
-      const context = socketContexts.get(socket.id);
+      const context = getSocketContext(socket);
       if (!context?.roomId || !context.sessionId) {
-        sendCommandError(
-          socket,
-          "not_joined",
-          "Join a room before requesting state.",
-        );
         return;
       }
 
       const snapshot = store.getSnapshot(context.roomId);
       if (!snapshot) {
-        sendCommandError(socket, "unknown_room", "The room no longer exists.");
+        sendCommandError(socket, "unknown_room");
         return;
       }
 
@@ -308,13 +410,6 @@ export function createRoomWebSocketServer({
         state: snapshot,
       };
       socket.emit("state_snapshot", response);
-      logSync("request_state_emit", {
-        socketId: socket.id,
-        roomId: snapshot.roomId,
-        revision: snapshot.revision,
-        state: snapshot.playback.state,
-        currentTime: snapshot.playback.currentTime,
-      });
     });
 
     socket.on("heartbeat", (payload: unknown) => {
@@ -334,15 +429,9 @@ export function createRoomWebSocketServer({
         receivedAt: Date.now(),
       };
       socket.emit("heartbeat_ack", response);
-      logSync("heartbeat_ack_emit", {
-        socketId: socket.id,
-        sentAt: parsed.sentAt,
-        receivedAt: response.receivedAt,
-      });
     });
 
     socket.on("disconnect", () => {
-      logSync("socket_disconnected", { socketId: socket.id });
       const context = socketContexts.get(socket.id);
       socketContexts.delete(socket.id);
 
